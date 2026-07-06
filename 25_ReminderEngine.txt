@@ -3,8 +3,36 @@
  * Blueprint 迁入 2_Runtime/。承担 Decision（_shouldRemind/_isOverdue）+
  * Execution（checkReminders/_buildReminder/_sendReminder）两种角色，
  * 另外会触发 Runtime/Event（EventBus.publish）和 Runtime/Projection
- * （upsertRowByKey_）。这是本项目的核心域引擎，不拆成多个文件——原因见
- * 00_ADR_001_Domain_OS_Blueprint_Adoption.txt。]
+ * （现在是 batchUpsertRowsByKey_）。这是本项目的核心域引擎，不拆成多个
+ * 文件——原因见 00_ADR_001_Domain_OS_Blueprint_Adoption.txt。]
+ *
+ * 🐛 2026-07-06 外部审计修复（HIGH RISK 1/2、MEDIUM RISK 2、LOW RISK 1，
+ * 核实属实后采纳，完整决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt。
+ * 注意：这轮审计的 "HIGH RISK 2" 跟上一轮 HIGH RISK 2（due_date 临近性
+ * 判断，已经在 2026-07-06 早些时候修过）是两件不同的事，编号撞了，别混）：
+ *
+ * 1. HIGH RISK 1：checkReminders 循环里之前每提醒一个任务就立刻调
+ *    upsertRowByKey_（O(N) 次"扫全表找行号+写一行"的 Sheet I/O）。现在
+ *    循环里只更新内存、收集需要落盘的任务，循环结束后用
+ *    batchUpsertRowsByKey_（21_SheetUtils.gs 已有的批量函数，不重复
+ *    实现）一次性批量写回。
+ * 2. HIGH RISK 2：_sendReminder 之间加 Utilities.sleep(1000)，避免撞
+ *    Telegram 限流（2026-07-06 查了 Telegram 官方 Bots FAQ 核实：单聊天
+ *    ≤1条/秒，群组 ≤20条/分钟，全局批量 ≤约30条/秒——本项目的提醒几乎
+ *    都发到同一个 chat_id，单聊限流是这里真正要防的那道线，1秒节流足够）。
+ * 3. MEDIUM RISK 2：全部逻辑和常量包进 IIFE（ReminderEngine 模块），不再
+ *    平铺全局，跟 22_QueryEngine.gs/40_Output.gs 的写法一致，避免未来跟
+ *    其他模块合并部署时静默覆盖同名全局。
+ *    ⚠️ 对审计原始建议做了修正：checkReminders 不能只是 IIFE 返回对象里
+ *    的一个属性——GAS 的 ScriptApp.newTrigger('checkReminders') 是按
+ *    【字符串名字】找一个全局函数声明来绑定触发器，找不到
+ *    ReminderEngine.checkReminders 这种写法，触发器会直接失效。所以文件
+ *    最下面单独留了一个同名全局薄封装函数，只做转发，不含业务逻辑——这是
+ *    触发器能正常工作的唯一必须留在全局作用域的入口，也是
+ *    1_Foundation/11_Setup.gs 的 createTriggers() 唯一认识的名字。
+ * 4. LOW RISK 1：lock.waitLock 从 5000ms 延长到 30000ms——HIGH RISK 2 的
+ *    节流会让单次 checkReminders 正常耗时变长，5秒等待太容易让下一小时
+ *    触发器误判"前一个没跑完"而整段跳过。
  *
  * Reminder OS v1.0（原 JARVIS CORE v2.0 — Phase 1, Module 2）
  *
@@ -14,206 +42,227 @@
  * 的时间与通知服务"（见 Personal AI Core 项目 00_Project_Constitution.gs
  * 的 D2/D5）——不是 Productivity OS 专属，未来 Property/Finance/Vehicle
  * OS 的到期提醒也会用这一套，不会各自重复造轮子。
- * 拆分时只有两处因为依赖的函数换了地方而不得不改，见下面两个
- * "2026-07-03 拆分说明"标注；判断逻辑本身当时逐字未动。
+ * 拆分时只有两处因为依赖的函数换了地方而不得不改，判断逻辑本身当时逐字
+ * 未动。
  *
- * ✅ 2026-07-06 更新：_shouldRemind 的 HIGH RISK 2（缺少 due_date 临近性
- * 判断）已修复，见下方 "2026-07-06 bugfix" 注释，以及
- * 00_Project_State.txt「已完成」。REMINDER_INTERVAL_HOURS 数值本身未变。
+ * ✅ 2026-07-06（早些时候）：_shouldRemind 的上一轮 HIGH RISK 2（缺少
+ * due_date 临近性判断）已修复，见 00_Project_State.txt「已完成」。
+ * REMINDER_INTERVAL_HOURS 数值本身未变。
  *
  * due_date 字段两种格式：
  *   'YYYY-MM-DD'  → 日期类，直接判断是否过期，也能算距今多久
  *   '40000km'     → 里程类（保养用），暂时无法判断是否过期/距今多久
- *                    （需要 Rider OS 当前里程数据，等 RiderConnector 接好；
- *                    本次 bugfix 不处理这类，维持原行为，见下方说明）
+ *                    （需要 Rider OS 当前里程数据，等 RiderConnector 接好）
  */
 
-var REMINDER_INTERVAL_HOURS = {
-  CRITICAL: 4,
-  HIGH: 6,
-  MEDIUM: 12,
-  LOW: 24,
-  OVERDUE: 24 // R4: 逾期强制每24小时重复，不管原本优先级
-};
+var ReminderEngine = (function () {
 
-// 🐛 bugfix（2026-07-06，HIGH RISK 2，见 00_Project_State.txt「已完成」）：
-// 未逾期时，距 due_date 还剩多久（小时）才允许开始提醒。之前完全没有这层
-// 判断——任务一旦 PENDING，哪怕 due_date 在一个月后，也会立刻按优先级对应
-// 间隔（比如 MEDIUM=12小时）开始高频提醒。
-// 这里先用单一全局值，不分优先级——bug 报告里描述的修复方向就是一个统一的
-// "提前多久开始提醒"阈值，没提到要分优先级。以后如果想要"CRITICAL 提前
-// 更久、LOW 提前更短"，可以照 REMINDER_INTERVAL_HOURS 的结构改成按 bucket
-// 取值，这次先按最小修复范围来，不做额外扩展（P6，先不做过度设计）。
-// 72 这个数字是我（Claude）选的默认值，不是从代码或文档里反推出来的既定值，
-// 你觉得不合适可以直接改这一行，不影响下面的判断逻辑。
-var REMINDER_ADVANCE_HOURS = 72;
+  var REMINDER_INTERVAL_HOURS = {
+    CRITICAL: 4,
+    HIGH: 6,
+    MEDIUM: 12,
+    LOW: 24,
+    OVERDUE: 24 // R4: 逾期强制每24小时重复，不管原本优先级
+  };
 
-// 🐛 bugfix（2026-06-25，外部审计LOW RISK 1，核实属实后采纳）：
-// 如果某一次checkReminders执行卡顿（网络慢/Sheets IO阻塞），跑了好几分钟，
-// 下一次的每小时触发器又起来了，两个并行实例会同时查到同一批pending任务，
-// 在彼此的last_reminder_at刷新前都各自发了一次提醒，用户收到重复推送。
-// 加LockService互斥锁，拿不到锁说明前一个实例还在跑，直接跳过本次。
-function checkReminders() {
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(5000); // 等5秒，拿不到锁说明前序实例还没跑完，跳过本次
-  } catch (e) {
-    Logger.log('[ReminderEngine] 前序 checkReminders 实例尚未执行完毕，跳过本次执行');
-    return { checked: 0, sent: 0 };
-  }
+  // 上一轮 bugfix（2026-07-06，HIGH RISK 2，见 00_Project_State.txt「已完成」）：
+  // 未逾期时，距 due_date 还剩多久（小时）才允许开始提醒，默认72小时/3天，
+  // 可调整，不影响下面的判断逻辑。
+  var REMINDER_ADVANCE_HOURS = 72;
 
-  try {
-    var tasks = QueryEngine.getPendingTasks();
-    var sentCount = 0;
+  // 🐛 本轮 bugfix（2026-07-06，外部审计 HIGH RISK 2）：Telegram 单聊限流是
+  // 每秒最多1条消息，本项目的提醒几乎都发到同一个 chat_id，所以每发一条
+  // 就等这么久。先用固定1秒节流，不做更复杂的 per-chat/全局分别限流
+  // （P6，等真的出现多用户/多chat场景再升级）。
+  var TELEGRAM_SEND_THROTTLE_MS = 1000;
 
-    tasks.forEach(function (task) {
-      if (_shouldRemind(task)) {
-        var message = _buildReminder(task);
-        _sendReminder(task, message);
-        _updateReminderCount(task);
-        sentCount++;
+  // 🐛 本轮 bugfix（2026-07-06，外部审计 LOW RISK 1）：原来是5000ms。加了
+  // 上面的 Telegram 节流后单次 checkReminders 正常耗时会变长，5秒等待
+  // 太容易让下一小时触发器误判"前一个没跑完"而整段跳过提醒。延长到
+  // 30秒，仍然只占 GAS 6分钟执行上限的一小部分。
+  var LOCK_WAIT_MS = 30000;
+
+  /**
+   * 🐛 bugfix（2026-07-06，外部审计 HIGH RISK 1/2，核实属实后采纳）：
+   * 之前循环体内每提醒一个任务就立刻调 upsertRowByKey_（O(N) 次全表扫描
+   * 式 Sheet I/O）+ 无间隔连续调 Telegram sendMessage（撞限流）。
+   * 现在：循环内只更新内存对象、收集需要落盘的任务，发送之间加节流；
+   * 循环结束后一次性 batchUpsertRowsByKey_ 批量写回（复用
+   * 21_SheetUtils.gs 已有的批量函数，不重复实现，避免 C5）。
+   */
+  function checkReminders() {
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(LOCK_WAIT_MS);
+    } catch (e) {
+      Logger.log('[ReminderEngine] 前序 checkReminders 实例尚未执行完毕，跳过本次执行');
+      return { checked: 0, sent: 0 };
+    }
+
+    try {
+      var tasks = QueryEngine.getPendingTasks();
+      var sentCount = 0;
+      var updatedTasks = []; // HIGH RISK 1: 收集需要批量落盘的任务，不逐个写
+
+      tasks.forEach(function (task) {
+        if (_shouldRemind(task)) {
+          var message = _buildReminder(task);
+          _sendReminder(task, message);
+          _recordReminderSent(task); // 只发事件+改内存，不再直接写Sheet
+          updatedTasks.push(task);
+          sentCount++;
+
+          // HIGH RISK 2: 节流，避免连续调用撞 Telegram 单聊限流
+          Utilities.sleep(TELEGRAM_SEND_THROTTLE_MS);
+        }
+      });
+
+      if (updatedTasks.length > 0) {
+        batchUpsertRowsByKey_('Tasks', 'task_id', updatedTasks);
       }
-    });
 
-    return { checked: tasks.length, sent: sentCount };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/**
- * 判断 due_date 是否已经过期。
- * 本次修改（2026-06-27，外部审计MEDIUM RISK 7，核实属实后采纳）：
- * 实际逻辑搬到了 21_SheetUtils.gs 的 isOverdue_()/parseDueDate_()——
- * 21_InventoryModule.gs 之前是跨文件直接调这里的私有函数，93_MemoryEngine.gs
- * 又自己重复实现了一份一样的逻辑，统一成共用版本，这里只剩一层委托，
- * 不再维护两份（甚至三份）相同判断逻辑。
- */
-function _isOverdue(task) {
-  return isOverdue_(task.due_date);
-}
-
-/**
- * ℹ️ 审计复核记录（2026-06-25，外部审计MEDIUM RISK 2，核实后判定不成立，未修改）：
- * 审计声称带时间部分、无offset的ISO字符串（如'2026-06-22T15:30:00'）会被
- * new Date()按UTC解析，跟纯日期字符串是同一类时区bug。
- * 实测不成立：ECMA-262规范（ES2015+）规定——日期-时间格式（带T）在没有
- * offset时按【本地时区】解析，只有纯日期格式（不带T）才按UTC解析。
- * 用跟GAS同内核的V8（node）在Asia/Kuala_Lumpur时区下验证：
- *   new Date('2026-06-22T15:30:00') → 本地时间显示15:30（正确，跟手动
- *   构造的 new Date(2026,5,22,15,30,0) 完全一致），不是审计声称的23:30。
- * 06_TaskIntentParser.gs生成的due_date（"yyyy-MM-dd'T'HH:mm:ss"格式）本身
- * 就是用脚本时区格式化出来的本地时间字符串，下面这行 new Date(raw) 解析
- * 回来正好还原成同一个本地时刻，没有偏移。保持原样，不采纳这条。
- *
- * （这条复核记录原本贴在 _parseDueDate_() 函数上方，2026-06-27把函数本体
- * 搬到05_SheetUtils.gs了，记录留在这里方便以后查历史；2026-07-06该文件
- * 又改名迁到 21_SheetUtils.gs，见 00_File_Map.txt。）
- */
-
-function _shouldRemind(task) {
-  var overdue = _isOverdue(task);
-
-  // 🐛 bugfix（2026-07-06，HIGH RISK 2）：未逾期 且 距 due_date 还早于
-  // REMINDER_ADVANCE_HOURS 时，直接不提醒。里程类/无法解析的 due_date
-  // （_hoursUntilDue 返回 null）维持原行为不受影响——那类判断依赖
-  // RiderConnector 的当前里程数据，还没接，不在这次修复范围内。
-  if (!overdue) {
-    var hoursUntilDue = _hoursUntilDue(task);
-    if (hoursUntilDue !== null && hoursUntilDue > REMINDER_ADVANCE_HOURS) {
-      return false;
+      return { checked: tasks.length, sent: sentCount };
+    } finally {
+      lock.releaseLock();
     }
   }
 
-  var bucket = overdue ? 'OVERDUE' : task.priority;
-  var intervalHours = REMINDER_INTERVAL_HOURS[bucket] || 24;
-
-  if (!task.last_reminder_at) {
-    return true;
+  /**
+   * 判断 due_date 是否已经过期。
+   * 本次修改（2026-06-27，外部审计MEDIUM RISK 7，核实属实后采纳）：
+   * 实际逻辑搬到了 21_SheetUtils.gs 的 isOverdue_()/parseDueDate_()，
+   * 这里只剩一层委托，不再维护两份相同判断逻辑。
+   */
+  function _isOverdue(task) {
+    return isOverdue_(task.due_date);
   }
 
-  var hoursSince = (Date.now() - new Date(task.last_reminder_at).getTime()) / 3600000;
-  return hoursSince >= intervalHours;
-}
+  function _shouldRemind(task) {
+    var overdue = _isOverdue(task);
 
-/**
- * 距 due_date 还有多少小时（未来为正数，已过期为负数）。
- * 🐛 bugfix（2026-07-06，HIGH RISK 2）新增，专门供 _shouldRemind 判断
- * "是否提前太多、还不该提醒"用。
- * 里程类（'40000km'）或无法解析的 due_date 返回 null——调用方（目前只有
- * _shouldRemind）自行决定 null 时怎么处理；现在的选择是"维持原行为，不做
- * 提前量判断"，等 RiderConnector 接好、能算里程距今多久之后再处理这类。
- * 复用 21_SheetUtils.gs 的 parseDueDate_，跟 isOverdue_ 判断同一套解析
- * 逻辑，不重复实现一份类似的日期解析（避免 C5）。
- */
-function _hoursUntilDue(task) {
-  if (!task.due_date) return null;
-  var raw = String(task.due_date).trim();
-  if (/km$/i.test(raw)) return null;
-  var due = parseDueDate_(raw);
-  if (!due || isNaN(due.getTime())) return null;
-  return (due.getTime() - Date.now()) / 3600000;
-}
+    // 上一轮 bugfix（2026-07-06，HIGH RISK 2）：未逾期 且 距 due_date 还
+    // 早于 REMINDER_ADVANCE_HOURS 时，直接不提醒。里程类/无法解析的
+    // due_date（_hoursUntilDue 返回 null）维持原行为不受影响。
+    if (!overdue) {
+      var hoursUntilDue = _hoursUntilDue(task);
+      if (hoursUntilDue !== null && hoursUntilDue > REMINDER_ADVANCE_HOURS) {
+        return false;
+      }
+    }
 
-function _buildReminder(task) {
-  var overdue = _isOverdue(task);
-  var statusLabel = overdue ? 'OVERDUE' : task.status;
-  var icon = overdue ? '🔴' : '🟡';
+    var bucket = overdue ? 'OVERDUE' : task.priority;
+    var intervalHours = REMINDER_INTERVAL_HOURS[bucket] || 24;
 
-  var lines = [];
-  lines.push(icon + ' TASK REMINDER');
-  lines.push('');
-  lines.push('Title: ' + task.title);
-  lines.push('Status: ' + statusLabel);
+    if (!task.last_reminder_at) {
+      return true;
+    }
 
-  if (task.due_date) {
-    lines.push('Due: ' + task.due_date);
-  }
-  if (task.reminder_count > 0) {
-    lines.push('Reminded: ' + task.reminder_count + 'x');
+    var hoursSince = (Date.now() - new Date(task.last_reminder_at).getTime()) / 3600000;
+    return hoursSince >= intervalHours;
   }
 
-  return lines.join('\n');
-}
+  /**
+   * 距 due_date 还有多少小时（未来为正数，已过期为负数）。
+   * 里程类（'40000km'）或无法解析的 due_date 返回 null。
+   * 复用 21_SheetUtils.gs 的 parseDueDate_，不重复实现（避免 C5）。
+   */
+  function _hoursUntilDue(task) {
+    if (!task.due_date) return null;
+    var raw = String(task.due_date).trim();
+    if (/km$/i.test(raw)) return null;
+    var due = parseDueDate_(raw);
+    if (!due || isNaN(due.getTime())) return null;
+    return (due.getTime() - Date.now()) / 3600000;
+  }
 
-function _sendReminder(task, message) {
-  var keyboard = {
-    inline_keyboard: [[
-      { text: '✅ Done', callback_data: 'task_done:' + task.task_id },
-      { text: '⏰ Snooze 1h', callback_data: 'task_snooze:' + task.task_id }
-    ]]
+  function _buildReminder(task) {
+    var overdue = _isOverdue(task);
+    var statusLabel = overdue ? 'OVERDUE' : task.status;
+    var icon = overdue ? '🔴' : '🟡';
+
+    var lines = [];
+    lines.push(icon + ' TASK REMINDER');
+    lines.push('');
+    lines.push('Title: ' + task.title);
+    lines.push('Status: ' + statusLabel);
+
+    if (task.due_date) {
+      lines.push('Due: ' + task.due_date);
+    }
+    if (task.reminder_count > 0) {
+      lines.push('Reminded: ' + task.reminder_count + 'x');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * ⚠️ 2026-07-06 外部审计 MEDIUM RISK 1 关联说明（这个函数本身没有改
+   * 代码，改的是文档+诊断，见 00_Project_Constitution.gs 新增的 P6 契约
+   * 条款和 1_Foundation/11_Setup.gs 的 webhook 可达性检查）：
+   * 下面这两个 inline button 的 callback_data（task_done:/task_snooze:）
+   * 依赖【另一个项目】（Personal AI Core）注册了 Telegram webhook、并且
+   * 用同一个 Bot Token 实现了对这两种 callback_data 的解析——本项目自己
+   * "不接 webhook"，点按钮之后的实际处理完全不在这个文件、甚至不在这个
+   * GAS 项目里。这是当前架构下必须接受的跨项目耦合，没法在这个函数里
+   * 单独"修掉"，只能靠文档约束 + 诊断可达性检查来降低"两边失联"的风险。
+   */
+  function _sendReminder(task, message) {
+    var keyboard = {
+      inline_keyboard: [[
+        { text: '✅ Done', callback_data: 'task_done:' + task.task_id },
+        { text: '⏰ Snooze 1h', callback_data: 'task_snooze:' + task.task_id }
+      ]]
+    };
+    Output.sendMessage(task.chat_id, message, keyboard);
+  }
+
+  /**
+   * 🐛 bugfix（2026-07-06，外部审计 HIGH RISK 1，核实属实后采纳）：
+   * 原名 _updateReminderCount。之前这里直接调
+   * upsertRowByKey_('Tasks','task_id',task.task_id,task)，每提醒一个
+   * 任务就单独触发一次"扫全表找行号+写一行"的 Sheet I/O。
+   * 现在改名 _recordReminderSent，只做两件事：发布 REMINDER_SENT 事件、
+   * 更新内存里的 task.reminder_count——不再直接写 Sheet。实际的批量写入
+   * 挪到 checkReminders() 循环结束后统一处理，见那边的
+   * batchUpsertRowsByKey_ 调用。
+   *
+   * ⚠️ 2026-07-03 拆分说明（历史记录，写入时机已经变了，但这段仍然解释
+   * 了"这个操作在概念上对应 Core 项目原本的 _materializeTaskRow_"）：
+   * 原来这里调的是 _materializeTaskRow_（定义在 20_ProductivityModule.gs，
+   * 那个文件现在在 Productivity OS 项目，不在这个项目里）。
+   * _materializeTaskRow_ 在这个场景下其实只做了一件事——
+   * upsertRowByKey_(TASKS_SHEET_NAME,'task_id',taskId,task)（task对象
+   * 已经是完整的），效果等同于现在 checkReminders() 循环结束后那次
+   * batchUpsertRowsByKey_ 里对应这一条任务的部分。
+   */
+  function _recordReminderSent(task) {
+    EventBus.publish(
+      'REMINDER_SENT',
+      { task_id: task.task_id, sent_at: new Date().toISOString() },
+      task.chat_id,
+      'ReminderEngine'
+    );
+    task.reminder_count = (task.reminder_count || 0) + 1;
+    // 注意：这里不再调 upsertRowByKey_，Sheet 写入由 checkReminders()
+    // 循环结束后的 batchUpsertRowsByKey_ 统一处理。
+  }
+
+  return {
+    checkReminders: checkReminders
   };
-  Output.sendMessage(task.chat_id, message, keyboard);
-}
+})();
 
 /**
- * 本次修改（2026-06-27，外部审计HIGH RISK 3，核实属实后采纳）：
- * 之前调 _materializeTaskRow_(task.task_id) 没传第二个参数，导致每发一条
- * 提醒就要全量重放整张Events表（deriveTaskState_）。checkReminders()一次
- * 跑可能要发好几条提醒，等于每小时触发器期间重复读表+反序列化好几次，
- * 6分钟执行时限下大表容易超时被Google强制终止。
- * 现在把累加后的reminder_count直接写进内存里的task对象再传进去，
- * O(1)直接覆写通道，不用重放。
- *
- * ⚠️ 2026-07-03 拆分说明：原来这里调的是 _materializeTaskRow_（定义在
- * 20_ProductivityModule.gs，那个文件现在在 Productivity OS 项目，不在
- * 这个项目里）。_materializeTaskRow_ 在这个场景下其实只做了一件事——
- * upsertRowByKey_(TASKS_SHEET_NAME, 'task_id', taskId, task)（task对象
- * 已经是完整的，不会触发它另一个"没传task时全量derive兜底"的分支）。
- * 所以这里直接改成调 21_SheetUtils.gs 的 upsertRowByKey_，效果完全一样，
- * 不需要把整个 _materializeTaskRow_ 也搬一份过来。
- *
- * 这一步是 EventBus.publish('REMINDER_SENT',...) 之外的 safety-net 直写——
- * 就算 Productivity OS 项目的 ProjectionEngine 因为某些原因没处理到这个
- * 事件，Tasks Sheet 的 reminder_count 依然会被这里直接更新，不会漏更新。
+ * 🐛 bugfix（2026-07-06，外部审计 MEDIUM RISK 2，核实属实后采纳，但对
+ * 审计原始建议做了修正——见文件头注释第3点）：
+ * GAS 的时间触发器（ScriptApp.newTrigger('checkReminders')）是按字符串
+ * 名字在全局作用域找一个函数声明来绑定，不能绑定到
+ * ReminderEngine.checkReminders 这种 IIFE 返回对象的属性，否则触发器会
+ * 直接失效。这个薄封装是唯一必须留在全局作用域的入口，纯转发，不含任何
+ * 业务逻辑，也是 1_Foundation/11_Setup.gs 的 createTriggers() 唯一认识
+ * 的名字，不能改名。
  */
-function _updateReminderCount(task) {
-  EventBus.publish(
-    'REMINDER_SENT',
-    { task_id: task.task_id, sent_at: new Date().toISOString() },
-    task.chat_id,
-    'ReminderEngine'
-  );
-  task.reminder_count = (task.reminder_count || 0) + 1;
-  upsertRowByKey_('Tasks', 'task_id', task.task_id, task);
+function checkReminders() {
+  return ReminderEngine.checkReminders();
 }
