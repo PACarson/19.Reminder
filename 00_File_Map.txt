@@ -2,10 +2,11 @@
  * 00_File_Map.gs
  * Reminder OS v1.0 — 文件地图
  *
- * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写。旧版本
- * （扁平编号 00/01/02/03/05/12/15/92）的内容已经并入下面每个文件条目里，
- * 判断逻辑变化只有 HIGH RISK 2 这一处，其余都是物理位置+文件名+文档变化。
- * 完整决策依据见 00_ADR_001_Domain_OS_Blueprint_Adoption.gs。
+ * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写；11_Setup.gs
+ * 已替换为你提供的真实代码。旧版本（扁平编号 00/01/02/03/05/12/15/92）的
+ * 内容已经并入下面每个文件条目里，判断逻辑变化只有 HIGH RISK 2 这一处，
+ * 其余都是物理位置+文件名+文档变化。完整决策依据见
+ * 00_ADR_001_Domain_OS_Blueprint_Adoption.gs。
  */
 
 // ============================================================
@@ -30,11 +31,8 @@
  * 10_SecureConfig.gs 〔原 01_SecureConfig.gs〕— Configuration。
  *   本地副本，逐字未改。
  * 11_Setup.gs 〔原 15_Setup.gs〕— Configuration（+部分 Testing/Validation，
- *   未物理拆分，见 ADR-001 判断5）。
- *   ⚠️ 你上传的 15_Setup.txt 内容实际是 12_QueryEngine.txt 的复制，不是
- *   Setup 该有的 createTriggers/runDiagnostics。这份是我按 File_Map 旧版
- *   本 + README.md 的文字描述反推重建的，不是你的原始代码，需要你核对/
- *   替换，见 00_Project_State.gs「已知问题」。
+ *   未物理拆分，见 ADR-001 判断5）。逐字未改（2026-07-06 收到真实代码后
+ *   已替换掉最初的反推重建版，见 00_Project_State.gs「已完成」）。
  *
  * ── 2_Runtime ─────────────────────────────────────────────
  *
@@ -93,10 +91,11 @@
  * 2_Runtime/21_SheetUtils.gs
  *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]
  *
- * 1_Foundation/11_Setup.gs（⚠️待确认版本）
+ * 1_Foundation/11_Setup.gs
  *   → QueryEngine.getPendingTasks()                   [2_Runtime/22_QueryEngine.gs]
  *   → Output.sendMessage                              [4_Integration/40_Output.gs]
  *   → SecureConfig.getKey(...)                        [1_Foundation/10_SecureConfig.gs]
+ *   → SpreadsheetApp.openById(...).getSheetByName('Tasks')  [直接读，不经过 SheetUtils]
  *
  * 本项目不依赖 Personal AI Core / Productivity OS 的任何代码，只是读写
  * 同一张共享 Spreadsheet 里 Productivity OS 拥有的 Tasks 表（读全部字段+

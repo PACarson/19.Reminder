@@ -89,6 +89,16 @@
  *    00_Project_State.gs 明确标注"这是重建、不是原始代码，待确认"，
  *    没有假装这是验证过的真实代码。
  *
+ *    ✅ 【2026-07-06 同日跟进】Carson 提供了 15_Setup.gs 真实代码，已替换
+ *    掉重建版。File_Map/README 当初对这个文件行为的文字描述本身没有问题
+ *    （createTriggers 挂 checkReminders 每小时触发器、runDiagnostics 验证
+ *    Tasks 表可读+发测试消息，两边都对得上），确认纯粹是 zip 打包环节的
+ *    复制粘贴失误，不是文档跟代码脱节。真实版 runDiagnostics() 比重建版
+ *    多了 SPREADSHEET_ID / TELEGRAM_TOKEN 各自独立的存在性检查，且是逐条
+ *    Logger.log 输出诊断信息，不返回结构化对象——这类实现细节上的差异，
+ *    印证了当初"具体实现我没有依据，只能按最保守写法猜"那句话是对的，
+ *    没有虚构不存在的行为，只是猜得不够细。
+ *
  * 5. 15_Setup 的分层归属：createTriggers（挂 trigger）比较像 Foundation/
  *    Configuration（部署时的基础设施设置），runDiagnostics（验证部署是否
  *    正常）比较像 Testing/Validation。文件本身不到 40 行，两个函数放一起

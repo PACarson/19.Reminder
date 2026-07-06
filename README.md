@@ -47,11 +47,9 @@ Vehicle OS 的到期提醒也会用这一套（见 Personal AI Core 项目
 共享 Spreadsheet 里了（Productivity OS 建的）。
 
 ### 4. 跑一次 `runDiagnostics()` 验证
-应该能看到"能读到 Tasks 表"和一条测试 Telegram 消息。
-
-⚠️ `createTriggers()`/`runDiagnostics()` 所在的 `1_Foundation/11_Setup.gs`
-这次是重建版本，不是你原始代码，见下方文件清单里的标注和
-`0_Governance/00_Project_State.gs`「已知问题」。
+会在执行日志里逐条打印诊断结果：`SPREADSHEET_ID`/`TELEGRAM_TOKEN`/
+`TELEGRAM_CHAT_ID` 是否设置好了、能不能读到 Tasks 表、测试消息发不发得出去、
+`QueryEngine.getPendingTasks()` 能不能正常跑。
 
 ## 文件清单
 
@@ -62,7 +60,7 @@ Vehicle OS 的到期提醒也会用这一套（见 Personal AI Core 项目
 | `0_Governance/00_File_Map.gs` | 同名 | File Map | 全面重写 |
 | `0_Governance/00_ADR_001_Domain_OS_Blueprint_Adoption.gs` | （新增） | ADR | 记录这次 blueprint 采用的理由和判断 |
 | `1_Foundation/10_SecureConfig.gs` | `01_SecureConfig.gs` | Configuration | 逐字未改 |
-| `1_Foundation/11_Setup.gs` | `15_Setup.gs` | Configuration | ⚠️ 重建版本，待你确认，见上 |
+| `1_Foundation/11_Setup.gs` | `15_Setup.gs` | Configuration | 逐字未改 |
 | `2_Runtime/20_EventBus.gs` | `02_EventBus.gs` | Event | 逐字未改 |
 | `2_Runtime/21_SheetUtils.gs` | `05_SheetUtils.gs` | Projection + Decision支撑 + 通用工具 | 逐字未改 |
 | `2_Runtime/22_QueryEngine.gs` | `12_QueryEngine.gs` | Query | 逐字未改 |

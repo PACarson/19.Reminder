@@ -4,7 +4,7 @@
  *
  * ⚠️ 快照，不是日志。
  * LAST_UPDATED: 2026-07-06 — 修复 HIGH RISK 2；按 Domain OS Blueprint
- * 重组全部文件；发现并记录 15_Setup.gs 内容不符问题。
+ * 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换确认。
  */
 
 // ============================================================
@@ -29,6 +29,14 @@
  *   00_ADR_001_Domain_OS_Blueprint_Adoption.gs 记录采用理由和具体判断。
  *   GAS 是扁平命名空间、没有 import，重命名/挪动文件不影响任何调用关系，
  *   这次改动纯粹是物理位置+文件名+文档，不涉及任何函数签名或调用方式变化。
+ *
+ * - 2026-07-06：收到 15_Setup.gs 真实代码，确认打包时那份内容确实是误把
+ *   12_QueryEngine.txt 复制进去了。已用真实代码替换 1_Foundation/11_Setup.gs
+ *   里之前那份反推重建版。真实版 runDiagnostics() 比重建版多做了
+ *   SPREADSHEET_ID / TELEGRAM_TOKEN 各自独立的存在性检查，且是逐条
+ *   Logger.log 输出诊断信息的风格，不返回结构化对象——File_Map/README
+ *   当初对这个文件行为的文字描述本身没有问题，纯粹是 zip 打包时这一个
+ *   文件被顶替了。
  */
 
 // ============================================================
@@ -44,18 +52,6 @@
 // ============================================================
 
 /**
- * - 【2026-07-06 新发现，待你确认】你这次上传的 15_Setup.txt，文件内容
- *   实际是 12_QueryEngine.txt 的完整复制（文件头注释都写着
- *   "12_QueryEngine.gs"），不是 00_File_Map.gs / README.md 描述的
- *   createTriggers/runDiagnostics。大概率是打包这个 zip 时的复制粘贴
- *   失误，不是你 Apps Script 项目里的真实状态。
- *   我按 File_Map/README 的文字描述反推重建了一份放在
- *   1_Foundation/11_Setup.gs，行为上是"挂 checkReminders 每小时触发器"+
- *   "验证 Tasks 表可读+发一条测试 Telegram 消息"，但具体实现细节
- *   （有没有去重逻辑、诊断输出格式等）是我猜的，不是你的原始代码。
- *   请对照你 Apps Script 编辑器里真实的 15_Setup.gs，不一致的话把真实
- *   内容发我替换掉这份重建版。
- *
  * - "接V3改EventBus.publish"这条旧 TODO：这次核实，代码（现
  *   2_Runtime/25_ReminderEngine.gs 的 _updateReminderCount）确实已经在调
  *   EventBus.publish('REMINDER_SENT', ...)。跟这条笔记本身的猜测一致——
@@ -69,29 +65,25 @@
 // ============================================================
 
 /**
- * 优先级 P1（建议先做）：
- *   1. 确认/替换 1_Foundation/11_Setup.gs（见上「已知问题」）——这个不
- *      确认，项目的触发器挂载和部署自检就没有可信版本。
- *
  * 优先级 P2（这次改动留下的判断，建议过一遍）：
- *   2. REMINDER_ADVANCE_HOURS 默认给了 72 小时（3天），是 Claude 选的，
+ *   1. REMINDER_ADVANCE_HOURS 默认给了 72 小时（3天），是 Claude 选的，
  *      不是从你的文档/代码反推出来的既定值——按你实际提醒习惯调整这个
  *      数字即可，不影响判断逻辑本身。
- *   3. 如果想要「CRITICAL 提前更久开始提醒、LOW 提前更短」这种按优先级
+ *   2. 如果想要「CRITICAL 提前更久开始提醒、LOW 提前更短」这种按优先级
  *      分开的提前量（而不是现在的单一全局值），是个可以照
  *      REMINDER_INTERVAL_HOURS 结构做的小改动，这次按 bug 报告里描述的
  *      最小范围先没做（P6，不做额外扩展）。
- *   4. 这次 blueprint 重组里，21_SheetUtils.gs 和 25_ReminderEngine.gs
+ *   3. 这次 blueprint 重组里，21_SheetUtils.gs 和 25_ReminderEngine.gs
  *      都是横跨多个 blueprint 子分类、没有拆分成更小的文件——理由和具体
  *      考虑见 00_ADR_001_Domain_OS_Blueprint_Adoption.gs，如果你希望拆得
  *      更细，可以再单独排。
- *   5. Domain OS Blueprint 是跨项目的平台级约定，权威定义按惯例应该也记
+ *   4. Domain OS Blueprint 是跨项目的平台级约定，权威定义按惯例应该也记
  *      一份在 Personal AI Core 的 00_Project_Constitution.gs——这次没有
  *      该项目的文件，只更新了 Reminder OS 自己这份，需要的话把 Core 项目
  *      文件也发我，我再同步过去。
  *
  * 优先级 P3（架构演进）：
- *   6. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
+ *   5. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
  *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
  *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
  */
