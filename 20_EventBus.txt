@@ -1,18 +1,25 @@
 /**
  * 20_EventBus.gs   [原 02_EventBus.gs — 2026-07-06 按 Domain OS Blueprint
- * 迁入 2_Runtime/（Event 子分类）。逻辑逐字未改，详见 00_File_Map.txt。]
+ * 迁入 2_Runtime/（Event 子分类）。详见 00_File_Map.txt。]
+ *
+ * 🐛 2026-07-06 外部审计修复（LOW RISK 2，核实属实后采纳，完整决策依据见
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.txt）：_sheet_() 现在把拿到的
+ * Sheet 对象缓存在闭包里，同一次执行内重复调用不再重新 openById，见下方
+ * _sheet_() 的注释。
  *
  * Reminder OS v1.0 — 事件总线（本项目负责的那部分 Events 表写入口）
  *
  * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 02_EventBus.gs 的本地副本，
- * 精简版——Reminder OS 只会 publish('REMINDER_SENT', ...)，而且
- * Tasks.reminder_count 的实际更新走的是 25_ReminderEngine.gs 里的直接
- * upsertRowByKey_（safety-net-as-primary，见那个文件的说明），不依赖这里
- * 的 publish() 内部触发 ProjectionEngine.dispatch()。所以本项目不需要
+ * 精简版——Reminder OS 只会 publish('REMINDER_SENT', ...)，不依赖这里的
+ * publish() 内部触发 ProjectionEngine.dispatch()。所以本项目不需要
  * 自己的 10_ProjectionEngine.gs——下面 publish() 里那个
  * "typeof ProjectionEngine !== 'undefined'" 检查会直接判否，安全跳过，
  * 不会报错。发布到 Events 表纯粹是为了保留一条完整、按时间顺序的审计记录
  * （跟 Core / Productivity OS 写的其他类型事件混在同一张共享表里）。
+ * Tasks.reminder_count 的实际更新走 2_Runtime/25_ReminderEngine.gs 里
+ * checkReminders() 循环结束后的批量 batchUpsertRowsByKey_（2026-07-06
+ * 起改成批量，之前是逐任务直接 upsertRowByKey_，见那个文件的 HIGH RISK 1
+ * 修复说明），不再依赖这里 publish() 内部的 Projection 分发。
  *
  * _sheet_() 用 SpreadsheetApp.openById() 而不是 getActiveSpreadsheet()——
  * Reminder OS 是独立（standalone）脚本，没有"容器"，必须显式指定
@@ -26,6 +33,7 @@ var EventBus = (function () {
 
   var _cachedEvents = null;
   var _inExecIdentityCache_ = {};
+  var _cachedSheet = null; // 🐛 LOW RISK 2 fix: 惰性缓存 Sheet 句柄
 
   function _spreadsheet_() {
     var id = SecureConfig.getKey('SPREADSHEET_ID');
@@ -36,14 +44,27 @@ var EventBus = (function () {
     return SpreadsheetApp.openById(id);
   }
 
+  /**
+   * 🐛 bugfix（2026-07-06，外部审计 LOW RISK 2，核实属实后采纳）：
+   * 之前每次 publish()/getAllEvents() 都会重新 SecureConfig.getKey +
+   * SpreadsheetApp.openById，哪怕同一次执行里已经打开过。现在把拿到的
+   * Sheet 对象缓存在闭包里，同一次执行内第二次调用直接复用。
+   * GAS 的 Sheet 对象本身是"引用"不是数据快照——缓存这个引用不会读到
+   * 过期数据，appendRow/getRange 等操作永远打到实时的 Spreadsheet，只是
+   * 省掉重复 openById 的开销。这个缓存只在本次执行的生命周期内有效
+   * （GAS 每次新的触发/调用都是全新的顶层作用域），不存在跨执行的脏缓存
+   * 问题，也不需要手动失效。
+   */
   function _sheet_() {
+    if (_cachedSheet) return _cachedSheet;
     var ss = _spreadsheet_();
     var sheet = ss.getSheetByName(SHEET_NAME);
     if (!sheet) {
       throw new Error('Events sheet 不存在——去 Personal AI Core 项目跑 setupSheets() 建表，' +
         '或确认 SPREADSHEET_ID 指对了表。');
     }
-    return sheet;
+    _cachedSheet = sheet;
+    return _cachedSheet;
   }
 
   function _generateEventId_() {
