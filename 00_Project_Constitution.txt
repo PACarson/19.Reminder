@@ -5,8 +5,9 @@
  * 平台级原则的权威定义在 Personal AI Core 项目的
  * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
  *
- * LAST_UPDATED: 2026-07-06 — 新增 P5（Domain OS Blueprint 落地采用），
- * 修订 P4（HIGH RISK 2 已修复，原文作为拆分时点的历史记录保留）。
+ * LAST_UPDATED: 2026-07-06 — 新增 P6（Telegram callback 跨项目契约，外部
+ * 审计 MEDIUM RISK 1 关联）；修订 P3（写入机制改成批量，外部审计
+ * HIGH RISK 1 关联）；修订 P5（Setup.gs 内容已确认，去掉待确认标注）。
  */
 
 /**
@@ -26,9 +27,15 @@
  *
  * P3. 数据边界
  *     只读 Tasks 表（属于 Productivity OS 的地盘），只写 Tasks 表的
- *     reminder_count/last_reminder_at 两个字段（直接 upsertRowByKey_，
- *     不通过 Productivity OS）+ 追加自己的 REMINDER_SENT 事件到共享
- *     Events 表。不碰 Tasks 表的其他字段，不碰 ActiveTasks/ArchiveTasks。
+ *     reminder_count/last_reminder_at 两个字段，不碰其他字段，不碰
+ *     ActiveTasks/ArchiveTasks；另外追加自己的 REMINDER_SENT 事件到共享
+ *     Events 表。
+ *
+ *     ✅ 2026-07-06 更新（外部审计 HIGH RISK 1 关联）：写 Tasks 表这两个
+ *     字段的机制从"每个任务各自直接 upsertRowByKey_"改成"checkReminders()
+ *     循环结束后 batchUpsertRowsByKey_ 一次性批量写"，仍然不通过
+ *     Productivity OS、仍然只碰这两个字段，只是物理写入的时机和批次变了，
+ *     见 2_Runtime/25_ReminderEngine.gs 的 HIGH RISK 1 修复说明。
  *
  * P4. 不变的东西（沿用 Core 宪法，历史记录）：
  *     2026-07-03 从 Core 拆分时：_shouldRemind 的判断逻辑（含当时已知的
@@ -57,9 +64,8 @@
  *     为准，记得回来同步这里。
  *
  *     Reminder OS 目前只用到其中三层：
- *       - Foundation（Configuration：SecureConfig；另外 Setup 的 createTriggers
- *         部分也算这层，细节见 P4 之外的 1_Foundation/11_Setup.gs 文件头，
- *         那个文件内容有待你确认，见 00_Project_State.gs）
+ *       - Foundation（Configuration：SecureConfig + Setup 的 createTriggers
+ *         部分）
  *       - Runtime（Event / Projection / Query / Decision / Execution，
  *         对应 EventBus / SheetUtils / QueryEngine / ReminderEngine）
  *       - Integration（APIs：Output.gs 对接 Telegram Bot API）
@@ -70,4 +76,41 @@
  *     哪个文件对应 blueprint 的哪一层/哪个子分类、为什么某些文件（比如
  *     21_SheetUtils.gs、25_ReminderEngine.gs）横跨多层没有拆分，完整依据
  *     见 00_File_Map.txt 和 00_ADR_001_Domain_OS_Blueprint_Adoption.txt。
+ *
+ * P6. 跨项目契约：Telegram Interactive Callback（2026-07-06 新增，外部
+ *     审计 MEDIUM RISK 1 关联，完整决策依据见
+ *     00_ADR_002_ReminderEngine_Audit_Fixes.txt）
+ *     2_Runtime/25_ReminderEngine.gs 的 _sendReminder 发出的提醒消息带
+ *     inline button（✅ Done / ⏰ Snooze 1h），callback_data 格式固定为
+ *     'task_done:{task_id}' / 'task_snooze:{task_id}'。
+ *
+ *     Reminder OS 自己【不接 Telegram webhook】（见 P2）——这两个按钮被
+ *     点击后产生的 callback_query，只能由另一个注册了 webhook、且用
+ *     同一个 TELEGRAM_TOKEN 的项目（目前是 Personal AI Core）接住并解析。
+ *     这是必须显式承认、不能靠"应该没问题"默认成立的跨项目耦合：
+ *       - 两边 TELEGRAM_TOKEN 必须是同一个值（README 已注明）
+ *       - Core 项目必须实现对 'task_done:'/'task_snooze:' 前缀的解析，
+ *         协议不能单方面改动
+ *       - 如果 Core 的 webhook 没注册、掉线、或 token 不一致，用户点按钮
+ *         会一直转圈直到 Telegram 超时，本项目这边不会有任何报错或日志
+ *
+ *     1_Foundation/11_Setup.gs 的 runDiagnostics() 新增了 webhook 可达性
+ *     检查（调 Telegram getWebhookInfo，看 url 是否非空），部署时或怀疑
+ *     按钮失灵时可以手动跑一次排查，但这只能检测"webhook 有没有注册"，
+ *     检测不了"Core 项目是否正确解析了这两种 callback_data"——后者没有
+ *     办法从 Reminder OS 这边验证，只能靠这条契约本身的文档约束，以及
+ *     两边各自代码走查。
+ *
+ * P7. 长期方向（2026-07-06 新增，Proposed，不是已确立的架构）
+ *     收到一份把 Reminder OS 升级成"AI-native 提醒平台"的构想（7个新
+ *     Runtime 引擎 + Foundation schema 扩展 + Intelligence 层预留 + 支持
+ *     8个 Domain OS + 11种新 Event 类型），完整评估、好的部分、担心的
+ *     部分、建议的起步范围，见 00_ADR_003_Reminder_OS_V2_Vision_
+ *     Evaluation.gs——不在这里逐条重复。
+ *
+ *     ⚠️ 重要：这条 P7 只是"记录有这个方向在讨论"，不代表任何一个新引擎
+ *     已经设计定案或者开始实现。当前唯一在跑的实现还是 P1-P6 描述的这套
+ *     V1（单一 ReminderEngine，只认 due_date + priority 这一种规则形状）。
+ *     File_Map.gs 里没有为 V2 新增任何"预留"资料夹——范围还没有拍板，
+ *     不提前建看起来像是"已经决定"的结构。
  */
