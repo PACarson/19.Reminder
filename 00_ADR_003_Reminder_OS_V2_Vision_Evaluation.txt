@@ -83,25 +83,160 @@
  *      空文件夹本身就是一种"看起来已经决定了"的暗示，不建。
  *
  * 如果你确认要往这个方向走，比字面这份 proposal 更谨慎、也更可能真正
- * 有用的起步方式：先只做 Temporal Engine 这一块——把"规则字符串 → 下次
- * 触发时间"这个计算能力做出来（对应 proposal 里的
- * calculateNextReminder/calculateFutureOccurrences/isReminderDue），
- * 先支持 Daily/Weekly/Monthly/Yearly/Every-X-days 这几种最常见的，
- * 让 Reminder OS 真正具备"周期性提醒"这个当前缺失的能力，同时验证这个
- * 时间引擎的设计好不好用。Escalation/Snooze/Analytics/多渠道 Dispatcher/
- * Intelligence 这些，等 Temporal Engine 跑起来、真的观察到需求时再逐个
- * 加——不需要现在就把全部 7 个一次性设计完。这条路径跟这个项目一贯的
- * "先做小范围、按实际情况扩展"的做法一致（P6），也是我会建议的下一步，
- * 但最终范围怎么定，你说了算。
+ * 有用的起步方式：先只做 Temporal Engine 这一块，具体拆解见下面的
+ * Architecture Roadmap。
+ *
+ * === Architecture Roadmap（Phase A → F，2026-07-06 补充）===
+ *
+ * 这一节采纳了 Carson 转述的第三方评估里"contract 可以先想、不用等到
+ * 实现"的意见，但没有对每个 phase 一视同仁地套用——不同 phase 现在
+ * 就把接口形状定下来的把握程度差很多，分开处理：
+ *
+ * Phase A — Temporal Engine（现在就做，唯一进入实现阶段的 phase）
+ *   目的：把"规则 → 下次触发时间"这个计算能力做成一个不知道"提醒"、
+ *   不知道 task、不知道 chat_id 的纯日期规则引擎——这样 Finance/Property/
+ *   Vehicle 以后要复用的时候，直接用这个引擎算它们自己的账单/租金/保养
+ *   周期，不需要先长出一层"提醒"外壳才能碰到里面的日期计算。
+ *   这次先支持的规则形状：Daily / Weekly / Monthly / Yearly / Every-X-days
+ *   ——不是 proposal 里列的 30 多种全部做完，跟当初 recurring task 自动
+ *   生成收窄成"日/周/月/年、interval=1"是同一个思路。
+ *   接口（这个 phase 会真的实现，不是草稿）：
+ *     parseRule(ruleSpec) → 标准化的内部 schedule 模型
+ *     calculateNextOccurrence(schedule, fromTime) → 下一次触发时间
+ *     calculateOccurrences(schedule, fromTime, untilTime) → 区间内全部触发时间
+ *     isDue(schedule, checkTime) → boolean
+ *   明确不包含：missed-occurrence 补偿（属于 Phase B，是"提醒"专属的
+ *   关注点，不是通用日期计算该管的事）、复杂 timezone 处理（先假设都在
+ *   脚本时区，真的需要跨时区时再加）。
+ *
+ * Phase B — Reminder Scheduler（依赖 Phase A 完成）
+ *   目的：把 Temporal Engine 的通用计算接到 Reminder OS 自己的场景——
+ *   读新的 Reminder Rule schema（谁的规则、提醒给谁），调 Temporal Engine
+ *   算下次触发时间，处理"checkReminders 有一小时没跑、是不是错过了一次
+ *   该发的提醒"这类 reminder 专属的补偿逻辑。这一层知道"提醒"是什么，
+ *   Temporal Engine 不需要知道。
+ *   现在不写具体接口——要等 Phase A 真的跑起来，看 Temporal Engine 暴露
+ *   出来的接口用起来顺不顺手，再设计 Scheduler 怎么接它更合适。
+ *
+ * Phase C — Snooze（草案级别）
+ *   目的：10分钟/30分钟/明天早上/自定义时间 的延后提醒，不破坏原本排程。
+ *   粗略方向：snoozeReminder(reminderId, until) 这类形状大概率不会错太
+ *   多，但不在这次锁定——真到这个 phase 时手上会有 Phase A/B 跑出来的
+ *   真实数据结构，到时候顺着那个设计，比现在凭空猜更准。
+ *
+ * Phase D — Escalation（暂不写接口）
+ *   目的：超过X次没响应就升级（换间隔/换渠道/标记紧急）。
+ *   这次评估里我跟第三方建议不完全一致的地方：Escalation 的规则形状
+ *   高度依赖"用户实际会怎么忽略提醒"这个现在完全没有数据支撑的东西——
+ *   现在写接口，本质上是在猜一个我们连需求都还没观察到的东西该长什么样。
+ *   这里只记"这个阶段要解决什么问题"，不写方法签名。等 Snooze/Scheduler
+ *   跑一段时间、真的看到"提醒被忽略"的模式之后，Escalation 该长什么样
+ *   会清楚很多，那时候设计比现在猜的准。
+ *
+ * Phase E — Dispatcher 抽象（等第二个通知渠道出现）
+ *   目的：send() / retry() / cancel() 这类多渠道发送抽象。今天只有
+ *   Telegram，4_Integration/40_Output.gs 本身就是事实上的 Dispatcher，
+ *   不需要额外抽象层——抽出来了也没有第二个实现，纯粹是死代码。
+ *   这个我倾向同意第三方"可以先定"的判断：跟 Escalation/Analytics 不同，
+ *   "发/重试/取消"这个形状不太依赖还没发生的具体使用场景，换成
+ *   WhatsApp/Email/Push 也大概率还是这三个动作。所以粗略方向记在这里：
+ *     send(channel, target, message, options) → deliveryResult
+ *     retry(deliveryId) → deliveryResult
+ *     cancel(pendingDeliveryId) → boolean
+ *   但依然不是"锁定"，只是"这个猜测比 Escalation/Analytics 的猜测可信
+ *   得多"——真的抽这一层出来，还是要等第二个渠道真实出现的那一天。
+ *
+ * Phase F — Analytics / AI Recommendation（有数据之后，暂不写接口）
+ *   目的：完成率、平均响应时间、提醒疲劳检测、AI 推荐更好的提醒时间。
+ *   现在没有任何历史数据能告诉我们"什么指标其实有用"，写接口纯粹是
+ *   猜。等 Phase A-D 跑起来、真的积累了数据，这个阶段该长什么样会自己
+ *   浮现出来，那时候再设计。
+ *
+ * 一句话概括这节的分寸：Phase A 真做，Phase E 可以先画个草图（因为这类
+ * 抽象不太会因为具体用哪个渠道而改变），Phase B/C 等前一个 phase 跑出
+ * 真实数据结构后再设计，Phase D/F 现在写接口就是纯猜测，先不写。
+ *
+ * === Progression Rule（2026-07-06 补充）===
+ *
+ * A phase MUST NOT be started merely because it exists in this roadmap.
+ * Each subsequent phase MUST be justified by real implementation
+ * experience or observed usage. The roadmap represents possible
+ * evolution, not a delivery commitment.
+ *
+ * 白话：这份 Roadmap 是"可能会怎么演化"的地图，不是"以后一定会做"的
+ * 承诺，更不是 backlog。半年后如果有人（包括我自己）翻到这份 ADR，
+ * 看到"还有 Phase D、Phase E 没做"，不能直接得出"所以应该做"的结论——
+ * 开始一个新 phase 的理由只能是"前一个 phase 跑出来的真实经验/观察到的
+ * 真实用量"证明需要它，不能是"反正 roadmap 上写了"。
+ *
+ * 这条规则不只适用于 Reminder OS，以后其他 Domain OS 参照这份 roadmap
+ * 做类似的分阶段规划时，同样适用。
+ *
+ * === Exit Criteria（2026-07-06 补充）===
+ *
+ * Roadmap 不只要说清楚"什么时候可以开始"，也要说清楚"做到什么程度算
+ * 完成、可以考虑下一个 phase"，否则每个 phase 都容易无限膨胀。跟上面
+ * 的 Progression Rule 合起来看：满足 Exit Criteria 是"可以考虑进入下一
+ * phase"的必要条件，不是"自动触发"下一 phase 开工的理由——是否真的开工
+ * 下一 phase，仍然要回头看 Progression Rule。
+ *
+ * 只给现在已经有具体设计（Phase A/B/C）的阶段定 Exit Criteria；Phase
+ * D/E/F 连接口都还没写，也没有依据定"做到什么程度算完成"，勉强写只会
+ * 是另一种形式的瞎猜，所以留空，等设计阶段到了再补。
+ *
+ * Phase A（Temporal Engine）Exit Criteria： ✅ 全部满足，2026-07-06
+ *   ☑ parseRule/calculateNextOccurrence/calculateOccurrences/isDue 四个
+ *     函数都实现，且行为符合 00_ADR_004_Temporal_Engine_Design.gs 里锁定
+ *     的 Contract —— 见 1_Foundation/12_TemporalEngine.gs
+ *   ☑ Daily / Weekly / Monthly / Yearly / Every-X-days 五种规则形状都有
+ *     对应单元测试，覆盖正常情况 + 边界情况（比如 monthly day_of_month=31
+ *     遇到没有31号的月份），全部通过 —— 见
+ *     5_Testing/50_TemporalEngine_Tests.gs，39项测试全部通过
+ *   ☑ 【2026-07-06 收紧，见 ADR-004】至少两个不同视角的调用场景验证过，
+ *     不是只有一个——单一视角（哪怕真的接了 Reminder Scheduler）没法
+ *     证明这个引擎真的跟"提醒"无关，只是看起来无关。测试矩阵里同时
+ *     覆盖"Reminder 视角"和"非 Reminder 视角"（Finance/Vehicle 这类）
+ *     的用例即可，不需要真的建一个 Finance OS 项目 —— 测试文件里
+ *     medsRule（Reminder）/creditCardRule（Finance mock）/vehicleRule
+ *     （Vehicle mock）三组用例都通过
+ *
+ * Phase B（Reminder Scheduler）Exit Criteria：
+ *   □ 能正确处理 missed occurrence（checkReminders 隔了不止一小时才跑，
+ *     期间应该触发的 occurrence 不会被静默漏掉）
+ *   □ 支持至少一种 recurring reminder 端到端跑通：从 Reminder Rule 记录
+ *     到 Temporal Engine 算出触发时间，到 25_ReminderEngine.gs 真的发出
+ *     提醒消息
+ *
+ * Phase C（Snooze）Exit Criteria：
+ *   □ Snooze 不会修改原始的 recurring schedule 本身（比如"每周一提醒"
+ *     被 snooze 一次之后，下周一还是照常触发，不会因为 snooze 过一次就
+ *     从排程里消失或错位）
+ *   □ 支持从 snooze 状态恢复到正常排程
+ *
+ * Phase D/E/F：Exit Criteria 留空，理由同上——等到那个 phase 真的开始
+ * 设计（如果真的开始的话，见 Progression Rule）时再定义。
  *
  * === 后果 ===
  *
  * - 本次不产出任何新的实现代码（不管是 V1 的修改还是 V2 的雏形），符合
- *   proposal"这次不写实现"的要求。
- * - Constitution/State 各加一条简短的指向性记录，不包含 V2 proposal 里
- *   的具体设计细节（那些留在这份 ADR 里，不散落到多份文档，避免以后要
- *   同步好几处）。
- * - 如果你确认要推进，下一步是我需要知道：先做 Temporal Engine（我的
- *   建议），还是坚持按 proposal 原本的规模一次性都规划——不管选哪个，
- *   之后如果要落地成真实代码，会是单独的实现任务，不会只停留在文档层面。
+ *   proposal"这次不写实现"的要求——Architecture Roadmap 里 Phase A 的
+ *   接口是"设计"，不是代码，真正写 Temporal Engine 的实现是下一个、
+ *   单独的任务。
+ * - Constitution/State 各加一条简短的指向性记录，不包含 V2 proposal 或
+ *   这份 Roadmap 的具体设计细节（那些留在这份 ADR 里，不散落到多份文档，
+ *   避免以后要同步好几处）。
+ * - Phase A-F 的颗粒度不是均匀的：Phase A 有具体接口、Phase E 有粗略
+ *   草图、Phase B/C/D/F 只有目的、没有接口——这是刻意的，不是漏写，
+ *   理由见各 phase 条目。
+ * - 下一个决定点：是否现在就开始实现 Phase A（Temporal Engine）。这份
+ *   ADR 本身只是设计/评估，不包含任何 .gs 代码；一旦确认要动手，会是
+ *   独立的实现任务。
+ * - 2026-07-06（同日跟进）：在真的写 TemporalEngine.gs 之前，先把
+ *   Phase A 拆成 A0（Contract/数据模型/边界设计）和 A1（实现）——A0 的
+ *   具体内容见 00_ADR_004_Temporal_Engine_Design.gs，同样不含实现代码，
+ *   只锁定 RuleSpec/Schedule Model 长什么样、四个函数的输入输出、V1
+ *   支持和明确不支持哪些规则形状。理由：Temporal Engine 是要被 Finance/
+ *   Property/Vehicle 等未来项目复用的平台级能力，Contract 定错了之后
+ *   要改，波及的是所有消费者，不是 Reminder OS 一个项目——先把 Contract
+ *   钉死、经过 review，比一上来就写实现更划算。
  */

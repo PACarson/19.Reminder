@@ -4,9 +4,10 @@
  *
  * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写；11_Setup.gs
  * 已替换为你提供的真实代码；随后修复外部审计对 25_ReminderEngine.gs /
- * 20_EventBus.gs 的 6 项发现（HIGH/MEDIUM/LOW 各两条），完整决策依据见
- * 00_ADR_001_Domain_OS_Blueprint_Adoption.gs 和
- * 00_ADR_002_ReminderEngine_Audit_Fixes.gs。
+ * 20_EventBus.gs 的 6 项发现（HIGH/MEDIUM/LOW 各两条）；评估 Reminder OS
+ * V2 构想并规划分阶段 Roadmap；Phase A（Temporal Engine）完成 Contract
+ * 设计（A0）+ 实现（A1），5_Testing 层第一次有内容。完整决策依据见
+ * 00_ADR_001 到 00_ADR_004（见下）。
  */
 
 // ============================================================
@@ -18,19 +19,34 @@
  *
  * 00_Project_Constitution.gs — 项目宪法。P1-P2 未变，P3 更新为批量写入
  *   机制，P4 记录 HIGH RISK 2（上一轮）已修复，P5 记录 Domain OS Blueprint
- *   采用，新增 P6 记录 Telegram callback 跨项目契约。
+ *   采用，P6 记录 Telegram callback 跨项目契约，新增 P7 长期方向（一句话
+ *   指向 ADR-003，不在 Constitution 里罗列细节）。
  * 00_Project_State.gs — 项目状态快照。本次更新：新增本轮 6 项审计修复的
- *   完成记录，「已知问题」新增 MEDIUM RISK 1（持续存在、非单边可修复）。
+ *   完成记录，「已知问题」新增 MEDIUM RISK 1（持续存在、非单边可修复），
+ *   新增「长期方向」一节（Current/Future/Status 三行快照，指向 ADR-003）。
  * 00_File_Map.gs — 本文件。
  * 00_ADR_001_Domain_OS_Blueprint_Adoption.gs — 记录采用 blueprint 的
  *   背景、号段分配、文件映射表、以及几个关键判断（为什么
  *   SheetUtils/ReminderEngine 不拆分、Setup 归属哪层、Intelligence/Testing
  *   为什么留空）的完整理由。
- * 00_ADR_002_ReminderEngine_Audit_Fixes.gs — 【新增】记录外部审计对
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.gs — 记录外部审计对
  *   ReminderEngine/EventBus 的 6 项发现（HIGH/MEDIUM/LOW 各两条）逐条
  *   核实+修复的过程，包括对 MEDIUM RISK 2 审计原始建议的修正（GAS 触发器
  *   不能绑定到 IIFE 属性）和 MEDIUM RISK 1 为什么只能"文档化+诊断"而不是
  *   "消除"。
+ * 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs — 评估"Reminder OS V2"
+ *   构想（7个引擎+schema扩展+Intelligence预留+8个Domain OS集成+11种
+ *   事件类型），好的部分/担心的部分/建议范围；Architecture Roadmap
+ *   （Phase A→F，按"确定性"分层——接口/草图/仅目的三种颗粒度）；
+ *   Progression Rule（roadmap 不是 backlog，不因为列在上面就该做）；
+ *   各 phase 的 Exit Criteria。STATUS: Proposed，范围待 Carson 拍板。
+ * 00_ADR_004_Temporal_Engine_Design.gs — Phase A 拆成 A0（这份文档：
+ *   Contract 设计）+ A1（实现，见 1_Foundation/12_TemporalEngine.gs）。
+ *   定义 RuleSpec/Schedule Model 长什么样、四个函数的精确签名、
+ *   Immutable/Pure Function/Dependency Rule 等约束、边界情况决定（比如
+ *   monthly day_of_month 溢出时"跳过"而非"clamp"、every_n_days 的
+ *   start_date 锚点）、V1 支持哪些规则形状/明确不支持哪些、Test Matrix。
+ *   STATUS: Accepted，Gate Review 已过，A1 已实现并通过全部测试。
  *
  * ── 1_Foundation ──────────────────────────────────────────
  *
@@ -41,6 +57,12 @@
  *   最初的反推重建版；同日稍晚 runDiagnostics() 新增 Telegram webhook
  *   可达性检查（MEDIUM RISK 1 关联，见 ADR-002）。createTriggers() 逐字
  *   未改。
+ * 12_TemporalEngine.gs — 【新增，Phase A / A1】通用日期规则计算引擎，
+ *   Contract 见 00_ADR_004。不知道"提醒"，不调用本项目任何其他文件——
+ *   刻意保持零依赖，方便以后整份文件复制到 Finance OS/Vehicle OS 等
+ *   全新项目。Pure Function（无 IO/无 Logger/不读当前时间），Schedule
+ *   Model 不可变。支持 daily/weekly/monthly/yearly/every_n_days 五种
+ *   规则，V1 明确不支持的形状见 ADR-004。
  *
  * ── 2_Runtime ─────────────────────────────────────────────
  *
@@ -85,7 +107,15 @@
  *   API，本项目发消息的唯一出口）。逐字未改。
  *
  * ── 5_Testing ─────────────────────────────────────────────
- *   （暂无文件，见 5_Testing/_RESERVED.txt）
+ *
+ * 50_TemporalEngine_Tests.gs — 【新增】这个 blueprint 层第一次有内容。
+ *   覆盖 ADR-004 Test Matrix 的全部用例（daily/weekly/monthly/yearly/
+ *   every_n_days 的正常情况+边界情况、闰年/世纪年、fromTime/untilTime
+ *   精确命中、parseRule 非法输入、Immutable 验证、Reminder/Finance/
+ *   Vehicle 三种视角的消费者验证）。GAS 没有现成测试框架，跟
+ *   runDiagnostics() 一样的风格——手动跑、Logger.log 输出 PASS/FAIL。
+ *   之前这里空的时候有 _RESERVED.txt 说明原因，现在有真实内容了，那份
+ *   文件已经删除，不需要再带进 Apps Script 项目。
  */
 
 // ============================================================
@@ -120,6 +150,11 @@
  *                                                       2026-07-06 新增，MEDIUM RISK 1
  *                                                       关联，见 ADR-002]
  *
+ * 1_Foundation/12_TemporalEngine.gs
+ *   → （无）——刻意零依赖，只用 JS/GAS 内建能力，见 ADR-004 Dependency
+ *   Rule。目前没有任何文件调用它（Phase B/Reminder Scheduler 还没做，
+ *   见 00_ADR_003），只有 5_Testing/50_TemporalEngine_Tests.gs 在用。
+ *
  * 本项目不依赖 Personal AI Core / Productivity OS 的任何代码，只是读写
  * 同一张共享 Spreadsheet 里 Productivity OS 拥有的 Tasks 表（读全部字段+
  * 写 reminder_count/last_reminder_at 两个字段）和共享的 Events 表
@@ -132,8 +167,13 @@
  * repo 时用来对应 blueprint 的组织方式，贴进 Apps Script 编辑器时全部会
  * 变成一份扁平文件列表，只看文件名，不认目录，详见 README.md。
  *
- * 关于"Reminder OS V2"构想（7个新 Runtime 引擎等）：目前【没有】为此新增
- * 任何资料夹或占位文件——范围还在讨论阶段，没有拍板，见
+ * 关于"Reminder OS V2"构想（7个新 Runtime 引擎等）：Phase A（Temporal
+ * Engine）已完成 A0（Contract，00_ADR_004）+ A1（实现，
+ * 1_Foundation/12_TemporalEngine.gs + 5_Testing/50_TemporalEngine_
+ * Tests.gs，全部测试通过）。Phase B 及之后（Reminder Scheduler/Snooze/
+ * Escalation/Dispatcher/Analytics）都还没有任何实现文件或占位——按
+ * Progression Rule，不会因为 Phase A 做完就自动开始 Phase B，需要先有
+ * 实际需求或使用经验支撑。范围和分阶段规划见
  * 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs 和
- * 00_Project_State.gs「长期方向」。等确定要往下做，再回来更新这份文件。
+ * 00_Project_State.gs「长期方向」。
  */

@@ -6,7 +6,7 @@
  * LAST_UPDATED: 2026-07-06 — 修复上一轮 HIGH RISK 2；按 Domain OS
  * Blueprint 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换
  * 确认；修复本轮外部审计的 HIGH RISK 1/2、MEDIUM RISK 1/2、LOW RISK 1/2
- * 共6项。
+ * 共6项；完成 Phase A（Temporal Engine）Contract 设计 + 实现 + 测试。
  */
 
 // ============================================================
@@ -65,6 +65,25 @@
  *   全部6项改动都用 mock GAS 环境跑过针对性验证（批量写入次数、节流调用
  *   次数、IIFE 封装后内部函数不再泄漏到全局、webhook 诊断两种分支），
  *   不是只凭代码审查判断"看起来对"。
+ *
+ * - 2026-07-06：完成 Phase A（Temporal Engine）的 A0（Contract 设计，
+ *   00_ADR_004_Temporal_Engine_Design.gs）+ A1（实现，
+ *   1_Foundation/12_TemporalEngine.gs）。Gate Review 5点确认（时间基准/
+ *   错误处理约定/测试矩阵/性能上限/调用关系）+ 4条精化（Immutable/Pure
+ *   Function/timezone 参数取舍/Dependency Rule）全部并入 ADR-004。
+ *   实现过程中发现并修了一个真实 Contract 漏洞：every_n_days 原本没有
+ *   锚点日期，同一条规则从不同时间点查询会得到不一致结果——补上了必填
+ *   的 start_date 字段，回写进 ADR-004（没有绕开 Contract 直接在代码里
+ *   悄悄兼容）。5_Testing/50_TemporalEngine_Tests.gs 覆盖完整 Test
+ *   Matrix（含闰年、世纪年边界、月份溢出跳过、fromTime/untilTime精确
+ *   命中、parseRule非法输入、Immutable验证、Reminder/Finance/Vehicle
+ *   三种视角消费者验证），39项测试全部通过。
+ *   决定不另开 00_ADR_005（Foundation Module Rules）——一是这条建议里
+ *   把 22_QueryEngine.gs 归为 Foundation 层是事实错误（实际是 Runtime/
+ *   Query，而且它本来就会读 Sheet，跟"禁止碰 Sheet"直接冲突）；二是
+ *   目前只有 Temporal Engine 一个 Foundation 新模块，"所有 Foundation
+ *   模块都要遵守"这句话现在只有一个真实案例支撑，属于 Progression Rule
+ *   要避免的"为还不存在的未来模块预先定规则"，理由见 ADR-004。
  */
 
 // ============================================================
@@ -89,7 +108,8 @@
  *   改动，这里不会有任何自动报错，只能靠人工核对两边代码。
  *
  * - "接V3改EventBus.publish"这条旧 TODO：这次核实，代码（现
- *   2_Runtime/25_ReminderEngine.gs 的 _updateReminderCount）确实已经在调
+ *   2_Runtime/25_ReminderEngine.gs 的 _recordReminderSent，2026-07-06
+ *   从 _updateReminderCount 改名，见 ADR-002）确实已经在调
  *   EventBus.publish('REMINDER_SENT', ...)。跟这条笔记本身的猜测一致——
  *   大概率是旧记录跟代码脱节（drift），不是真的还有未解决的部分。
  *   具体原意我这边没法进一步确认，如果 Carson 记得当时想解决的是什么、
@@ -122,9 +142,13 @@
  *      Personal AI Core 项目里处理 task_done:/task_snooze: 这两种
  *      callback_data 的代码也发我核对，确认协议双方真的对齐——单看
  *      Reminder OS 这边的代码没法验证这件事。
+ *   6. 1_Foundation/12_TemporalEngine.gs 现在没有任何调用方，是刻意的
+ *      （见 00_ADR_003 Progression Rule），不是漏接。真的需要"每周一
+ *      提醒我"这类 recurring 提醒时，下一步是 Phase B（Reminder
+ *      Scheduler）——但要等到那时候再单独设计，不是现在顺手就接上。
  *
  * 优先级 P3（架构演进）：
- *   6. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
+ *   7. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
  *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
  *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
  */
@@ -134,13 +158,23 @@
 // ============================================================
 
 /**
- * - 2026-07-06：收到"Reminder OS V2 (AI-Native 提醒平台)"构想（7个新
- *   Runtime 引擎 + Foundation schema 扩展 + Intelligence 层预留 + 支持
- *   8个 Domain OS + 11种新 Event 类型）。完整评估（好的部分/担心的部分/
- *   建议的起步范围）见 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs。
+ * Current: V1（单一 ReminderEngine，只认 due_date + priority 这一种规则
+ *          形状，2026-07-06 完成 HIGH/MEDIUM/LOW 六项审计修复后的版本）
+ *          + Phase A（Temporal Engine，通用日期规则计算，1_Foundation/
+ *          12_TemporalEngine.gs，已实现，39项测试全部通过）——但 Phase A
+ *          目前【没有任何东西在调用它】，V1 的实际提醒逻辑
+ *          （25_ReminderEngine.gs）完全没有改动，跟 Temporal Engine
+ *          还没有任何连接。
+ * Future:  Phase B（Reminder Scheduler）——把 Temporal Engine 接到
+ *          Reminder OS 自己的 recurring 提醒场景，让"每周一提醒我"这类
+ *          规则真正能用
+ * Status:  Phase A = Done（Contract + 实现 + 测试）。Phase B = 未开始，
+ *          按 Progression Rule，不因为 Phase A 做完就自动开始，需要先
+ *          有实际需求驱动
  *
- *   ⚠️ 明确记录：这纯粹是方向性讨论，V1（现在这套单一 ReminderEngine，
- *   只认 due_date + priority）仍是唯一在跑的实现，V2 里提到的任何引擎/
- *   schema/事件类型都还没有一行代码、也没有物理文件占位。等你确认要不要
- *   推进、推进到什么范围，再决定下一步是否需要实现任务。
+ * 完整构想、评估、Phase A→F 路线图、Progression Rule、Exit Criteria，
+ * 见 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs；Phase A 的具体
+ * Contract，见 00_ADR_004_Temporal_Engine_Design.gs。不在这里重复列出。
+ * 这一节只保证一件事：Current 里写了什么，就真的有对应的 .gs 文件和
+ * 测试；没写的（Phase B 及之后），就真的还没有一行代码。
  */
