@@ -2,7 +2,12 @@
  * 00_File_Map.gs
  * Reminder OS v1.0 — 文件地图
  *
- * LAST_UPDATED: 2026-07-06 — 按 Domain OS Blueprint 全面重写；11_Setup.gs
+ * LAST_UPDATED: 2026-07-10 — 修复第四轮外部审计发现的 HIGH RISK 1/2/3、
+ * MEDIUM RISK 1 共4项（EventBus 批量发布 Events、重试 trigger 清理、
+ * 时间预算重新推导、Tasks 表定点字段更新）；核实 MEDIUM RISK 2/
+ * LOW RISK 1 属实但不适合/不需要代码修复。完整决策依据见 00_ADR_002
+ * 「第四轮外部审计」章节。
+ * 2026-07-06 — 按 Domain OS Blueprint 全面重写；11_Setup.gs
  * 已替换为你提供的真实代码；修复第一轮外部审计对 25_ReminderEngine.gs /
  * 20_EventBus.gs 的 6 项发现；评估 Reminder OS V2 构想并规划分阶段
  * Roadmap；Phase A（Temporal Engine）完成 Contract 设计（A0）+ 实现
@@ -20,23 +25,29 @@
 /**
  * ── 0_Governance ──────────────────────────────────────────
  *
- * 00_Project_Constitution.gs — 项目宪法。P1-P2 未变，P3 更新为批量写入
+ * 00_Project_Constitution.gs — 项目宪法。P1-P2 未变（P1 在第四轮审计后
+ *   新增一段核实记录，结论仍是"未变"，见下），P3 更新为批量写入
  *   机制，P4 记录 HIGH RISK 2（上一轮）已修复，P5 记录 Domain OS Blueprint
- *   采用，P6 记录 Telegram callback 跨项目契约，新增 P7 长期方向（一句话
- *   指向 ADR-003，不在 Constitution 里罗列细节）。
+ *   采用，P6 记录 Telegram callback 跨项目契约，P7 长期方向（一句话
+ *   指向 ADR-003，不在 Constitution 里罗列细节）。【2026-07-10】P3 进一步
+ *   更新为定点字段更新+Events批量发布，见下 21/25/20 三个文件的条目。
  * 00_Project_State.gs — 项目状态快照。本次更新：新增本轮 6 项审计修复的
  *   完成记录，「已知问题」新增 MEDIUM RISK 1（持续存在、非单边可修复），
  *   新增「长期方向」一节（Current/Future/Status 三行快照，指向 ADR-003）。
+ *   【2026-07-10】新增第四轮 4 项修复的完成记录，「已知问题」新增
+ *   MEDIUM RISK 2（Telegram 送达状态不确定），「下一步」新增两个第四轮
+ *   引入的可调参数说明。
  * 00_File_Map.gs — 本文件。
  * 00_ADR_001_Domain_OS_Blueprint_Adoption.gs — 记录采用 blueprint 的
  *   背景、号段分配、文件映射表、以及几个关键判断（为什么
  *   SheetUtils/ReminderEngine 不拆分、Setup 归属哪层、Intelligence/Testing
  *   为什么留空）的完整理由。
  * 00_ADR_002_ReminderEngine_Audit_Fixes.gs — 记录外部审计对
- *   ReminderEngine/EventBus 的 6 项发现（HIGH/MEDIUM/LOW 各两条）逐条
- *   核实+修复的过程，包括对 MEDIUM RISK 2 审计原始建议的修正（GAS 触发器
- *   不能绑定到 IIFE 属性）和 MEDIUM RISK 1 为什么只能"文档化+诊断"而不是
- *   "消除"。
+ *   ReminderEngine/EventBus/SheetUtils/Output/Setup 四轮发现逐条核实+
+ *   修复的过程，包括对个别审计原始建议的修正（比如 GAS 触发器不能绑定到
+ *   IIFE 属性）、哪些问题只能"文档化+诊断"而不是"消除"、以及第四轮
+ *   两处"审计建议的具体修法本身会引入新风险/跟既有架构决定冲突"因而
+ *   改用其他方式处理的判断过程。
  * 00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs — 评估"Reminder OS V2"
  *   构想（7个引擎+schema扩展+Intelligence预留+8个Domain OS集成+11种
  *   事件类型），好的部分/担心的部分/建议范围；Architecture Roadmap
@@ -58,8 +69,9 @@
  * 11_Setup.gs 〔原 15_Setup.gs〕— Configuration（+部分 Testing/Validation，
  *   未物理拆分，见 ADR-001 判断5）。2026-07-06 收到真实代码后已替换掉
  *   最初的反推重建版；同日稍晚 runDiagnostics() 新增 Telegram webhook
- *   可达性检查（MEDIUM RISK 1 关联，见 ADR-002）。createTriggers() 逐字
- *   未改。
+ *   可达性检查（MEDIUM RISK 1 关联，见 ADR-002）。【2026-07-10】
+ *   runDiagnostics() 新增 checkReminders 名下 trigger 数量检查（第四轮
+ *   HIGH RISK 2 关联）。createTriggers() 逐字未改。
  * 12_TemporalEngine.gs — 【新增，Phase A / A1】通用日期规则计算引擎，
  *   Contract 见 00_ADR_004。不知道"提醒"，不调用本项目任何其他文件——
  *   刻意保持零依赖，方便以后整份文件复制到 Finance OS/Vehicle OS 等
@@ -76,10 +88,15 @@
  *   （第一轮 LOW RISK 2），同一次执行内不再重复 openById；公开 API 和
  *   行为不变。第二轮审计的 MEDIUM RISK 1（并发实例下内存去重失效）
  *   核实属实但决定不修，理由见 00_Project_State.gs「已知问题」。
+ *   【2026-07-10 第四轮，HIGH RISK 1】新增 publishBatch()，一次
+ *   setValues() 写入多行，取代 25_ReminderEngine.gs 循环内逐条调用
+ *   publish() 的单行同步写。原有 publish() 不变，继续保留作为单条发布
+ *   的能力。
  * 21_SheetUtils.gs 〔原 05_SheetUtils.gs〕— Projection（主：upsertRowByKey_/
- *   deleteRowByKey_/batchUpsertRowsByKey_）+ Decision 支撑（isOverdue_/
- *   parseDueDate_，供 ReminderEngine 用）+ 跨层通用工具（round1_/round2_/
- *   shallowCopy_/_cleanTitle_，历史上就是为了反重复实现才统一搬到这里）。
+ *   deleteRowByKey_/batchUpsertRowsByKey_/batchUpdateFieldsByKey_）+
+ *   Decision 支撑（isOverdue_/parseDueDate_，供 ReminderEngine 用）+
+ *   跨层通用工具（round1_/round2_/shallowCopy_/_cleanTitle_，历史上就是
+ *   为了反重复实现才统一搬到这里）。
  *   横跨多个子分类但没有物理拆分，理由见 ADR-001 判断6。
  *   【2026-07-06 第二轮审计，LOW RISK 1】包进 IIFE（SheetUtils 模块），
  *   是最后一个完成这项改造的"引擎风格"文件，对外暴露 SheetUtils.xxx
@@ -92,6 +109,12 @@
  *   回溯疑虑，行为完全等价。第三轮 HIGH RISK 2（QueryEngine 读整张表的
  *   性能问题，见下）核实属实但不在这个文件修，理由见
  *   00_Project_State.gs「已知问题」。
+ *   【2026-07-10 第四轮审计，MEDIUM RISK 1】新增 batchUpdateFieldsByKey_：
+ *   只读 key 列定位行号、只对实际改动的字段做单元格级定点写入，成本
+ *   正比于本批大小而不是表总行数，取代 25_ReminderEngine.gs 分批持久化
+ *   时复用的 batchUpsertRowsByKey_（那个函数每次调用都整表读写，成本
+ *   正比于表总行数）。batchUpsertRowsByKey_ 本身不变，继续保留给真正
+ *   需要"找不到就插入"语义的场景用。对外暴露函数数量从11个增加到12个。
  * 22_QueryEngine.gs 〔原 12_QueryEngine.gs〕— Query。
  *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。逻辑
  *   逐字未改，【2026-07-06】调用 SheetUtils 的方式同步改成命名空间形式
@@ -135,6 +158,22 @@
  *   代码/GAS平台能力不符，没有改动，理由见 00_Project_State.gs
  *   「已知问题」。TemporalEngine"死代码"那条不是新问题，是已经记录过
  *   的刻意决定（见「长期方向」）。
+ *   【2026-07-10 第四轮外部审计，见 ADR-002「第四轮」】四处修复：
+ *   ① _recordReminderSent 不再直接调 EventBus.publish，改成把事件草稿
+ *   塞进 pendingEvents 数组，checkReminders 跟 Tasks 批量写用同一套
+ *   节奏调 EventBus.publishBatch（HIGH RISK 1新）；② 新增
+ *   _cleanupStaleRetryTrigger_，checkReminders 最开头无条件调用，清理
+ *   上一次 _scheduleRetry_（原 _scheduleRetryOnce 改名）建的一次性
+ *   trigger，避免累积逼近20个trigger硬配额（HIGH RISK 2新）；
+ *   ③ EXECUTION_TIME_BUDGET_MS 改成显式按"硬上限−最坏单任务耗时−
+ *   安全垫"推导，BATCH_WRITE_CHUNK_SIZE 从20降到5（HIGH RISK 3新）；
+ *   ④ _persistBatch 改调 SheetUtils.batchUpdateFieldsByKey_ 而不是
+ *   batchUpsertRowsByKey_（MEDIUM RISK 1）。同时 RETRY_FLAG_KEY 语义
+ *   从"布尔标记"改成"存 trigger uniqueId"，新增 RETRY_COUNT_KEY 支持
+ *   最多 MAX_RETRY_ATTEMPTS(2) 次重试（原来只重试1次，LOW RISK 2新）。
+ *   审计另外两条（MEDIUM RISK 2 送达状态不确定、LOW RISK 1 抽象层建议）
+ *   核实属实但不适合/不需要代码修复，理由见 00_Project_State.gs
+ *   「已知问题」和 00_Project_Constitution.gs P1。
  *   2026-07-03 拆分时的判断逻辑本身、发消息内容、按钮结构均未变。
  *
  * ── 3_Intelligence ────────────────────────────────────────
@@ -143,7 +182,10 @@
  * ── 4_Integration ─────────────────────────────────────────
  *
  * 40_Output.gs 〔原 03_Output.gs〕— APIs / External Systems（Telegram Bot
- *   API，本项目发消息的唯一出口）。逐字未改。
+ *   API，本项目发消息的唯一出口）。核心发送逻辑逐字未改。【2026-07-10
+ *   第四轮，MEDIUM RISK 2 关联】catch 分支新增 ambiguousDelivery 标记，
+ *   用于区分"确定没发出去"和"可能已经送达但响应丢失"两种失败，纯诊断
+ *   增强，不改变原有的返回结构（仍是 {ok, error}，只是多一个可选字段）。
  *
  * ── 5_Testing ─────────────────────────────────────────────
  *
@@ -165,12 +207,15 @@
  * 2_Runtime/25_ReminderEngine.gs
  *   → QueryEngine.getPendingTasks()                 [2_Runtime/22_QueryEngine.gs]
  *   → SheetUtils.isOverdue_ / SheetUtils.parseDueDate_ /
- *     SheetUtils.batchUpsertRowsByKey_                [2_Runtime/21_SheetUtils.gs]
+ *     SheetUtils.batchUpdateFieldsByKey_               [2_Runtime/21_SheetUtils.gs]
  *   → Output.sendMessage                             [4_Integration/40_Output.gs]
- *   → EventBus.publish                                [2_Runtime/20_EventBus.gs]
+ *   → EventBus.publishBatch                           [2_Runtime/20_EventBus.gs]
  *   （2026-07-06 第一轮起：批量落盘不再是逐任务 upsertRowByKey_，见
  *   ADR-002 第一轮 HIGH RISK 1；第二轮起 SheetUtils 调用改命名空间形式，
- *   见 ADR-002 第二轮 LOW RISK 1）
+ *   见 ADR-002 第二轮 LOW RISK 1；2026-07-10 第四轮起，落盘目标函数从
+ *   SheetUtils.batchUpsertRowsByKey_ 换成 SheetUtils.batchUpdateFieldsByKey_，
+ *   Events 写入从循环内逐条 EventBus.publish 换成分批 EventBus.publishBatch，
+ *   见 ADR-002 第四轮 MEDIUM RISK 1 / HIGH RISK 1）
  *
  * 2_Runtime/22_QueryEngine.gs
  *   → SheetUtils.getSheet_ / SheetUtils.getHeaderMap_ [2_Runtime/21_SheetUtils.gs]

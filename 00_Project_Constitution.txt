@@ -5,7 +5,10 @@
  * 平台级原则的权威定义在 Personal AI Core 项目的
  * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
  *
- * LAST_UPDATED: 2026-07-06 — 新增 P6（Telegram callback 跨项目契约，外部
+ * LAST_UPDATED: 2026-07-10 — 修订 P3（写入机制细化为定点字段更新+Events
+ * 批量发布，第四轮外部审计 HIGH RISK 1/MEDIUM RISK 1 关联）；P1 补充
+ * 第四轮审计核实记录（LOW RISK 1 关联，结论：现状不变）。
+ * 2026-07-06 — 新增 P6（Telegram callback 跨项目契约，外部
  * 审计 MEDIUM RISK 1 关联）；修订 P3（写入机制改成批量，外部审计
  * HIGH RISK 1 关联）；修订 P5（Setup.gs 内容已确认，去掉待确认标注）。
  */
@@ -17,6 +20,16 @@
  *     共享 Spreadsheet 写自己的表，这个项目加一段"也查那张表"的逻辑，
  *     就能复用同一套提醒/通知机制，不需要每个 Domain OS 各自重新做一套
  *     （见 Core 项目 Constitution D2/D5）。
+ *
+ *     ✅ 2026-07-10 核实（第四轮外部审计 LOW RISK 1，结论：现状不变）：
+ *     审计建议为对接多个 Domain OS 引入一层抽象模型/字段映射，核实后
+ *     发现这跟上面这段已经写明的方案（新 Domain OS 接入时"加一段查询
+ *     逻辑"，不是"抽象一层通用接口"）方向相反。按 00_ADR_003_Reminder_
+ *     OS_V2_Vision_Evaluation.gs 里的 Progression Rule（不为还没出现的
+ *     真实需求预先设计），在 Property/Finance/Vehicle OS 任何一个真的
+ *     接入之前，没有足够信息判断"通用接口"该长什么样，维持本条现状，
+ *     不引入抽象层。完整决策依据见
+ *     00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」。
  *
  * P2. 部署形态
  *     独立 Apps Script 项目，完全自主运作：自己的时间触发器
@@ -36,6 +49,17 @@
  *     循环结束后 batchUpsertRowsByKey_ 一次性批量写"，仍然不通过
  *     Productivity OS、仍然只碰这两个字段，只是物理写入的时机和批次变了，
  *     见 2_Runtime/25_ReminderEngine.gs 的 HIGH RISK 1 修复说明。
+ *
+ *     ✅ 2026-07-10 更新（第四轮外部审计 HIGH RISK 1/MEDIUM RISK 1 关联）：
+ *     两处进一步细化，边界本身（只写这两个字段、只追加 Events、不碰
+ *     ActiveTasks/ArchiveTasks）没有变：
+ *       - 写 Tasks 表这两个字段，改成 SheetUtils.batchUpdateFieldsByKey_
+ *         按批次做定点单元格更新（不再整表读写），仍然只碰
+ *         reminder_count/last_reminder_at；
+ *       - 追加 REMINDER_SENT 事件到 Events 表，改成 EventBus.publishBatch
+ *         按批次一次性写入多行，不再是循环内逐条 appendRow。
+ *     完整决策依据见 2_Runtime/25_ReminderEngine.gs 文件头和
+ *     00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」。
  *
  * P4. 不变的东西（沿用 Core 宪法，历史记录）：
  *     2026-07-03 从 Core 拆分时：_shouldRemind 的判断逻辑（含当时已知的

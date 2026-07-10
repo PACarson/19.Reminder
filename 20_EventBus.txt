@@ -7,6 +7,21 @@
  * Sheet 对象缓存在闭包里，同一次执行内重复调用不再重新 openById，见下方
  * _sheet_() 的注释。
  *
+ * 🐛 2026-07-10 第四轮外部审计新增（HIGH RISK 1，核实属实后采纳，完整
+ * 决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」）：
+ * 新增 publishBatch()。25_ReminderEngine.gs 的 checkReminders 循环里，
+ * 之前每成功发送一条提醒就立刻调一次 publish()——publish() 内部同步执行
+ * appendRow()，是单行 I/O。Tasks 表的状态更新在第一轮就已经改成循环外
+ * 批量写（见下方旧注释），但 Events 表这条线一直是逐行同步写，没有跟着
+ * 一起改，这次审计指出的正是这个"改了一半"的遗漏。publishBatch() 把
+ * appendRow 换成一次 getRange(...).setValues(...) 写连续多行，调用方
+ * （25_ReminderEngine.gs）改成跟 Tasks 批量写用同一套分批节奏（累积到
+ * BATCH_WRITE_CHUNK_SIZE 就一起 flush），不是本文件自己决定什么时候批量、
+ * 什么时候不批量。原来的单条 publish() 不删、行为不变——本文件内部
+ * 没有其他调用方，但作为一个通用工具方法，"发单条事件"仍然是合理的
+ * 独立能力，不因为 ReminderEngine 这一个调用方改成批量就把单条能力也
+ * 拿掉。
+ *
  * Reminder OS v1.0 — 事件总线（本项目负责的那部分 Events 表写入口）
  *
  * ⚠️ 2026-07-03 拆分说明：这是 Personal AI Core 02_EventBus.gs 的本地副本，
@@ -112,6 +127,77 @@ var EventBus = (function () {
     return event;
   }
 
+  /**
+   * 🐛 2026-07-10 第四轮外部审计新增（HIGH RISK 1，核实属实后采纳，完整
+   * 决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」，也见
+   * 本文件头的说明）。
+   *
+   * 批量发布：一次 setValues() 写入多行连续的 Events 记录，取代"每条
+   * 事件各自 appendRow() 一次"。
+   *
+   * @param {object[]} eventDrafts  每个元素 { type, payload, chatId, source, identity? }
+   *                                identity 沿用单条 publish() 的执行内去重语义
+   * @returns {object[]}  实际写入（未被去重跳过）的 event 对象数组
+   */
+  function publishBatch(eventDrafts) {
+    if (!eventDrafts || eventDrafts.length === 0) return [];
+
+    var rows = [];
+    var published = [];
+
+    eventDrafts.forEach(function (draft) {
+      if (draft.identity) {
+        if (_inExecIdentityCache_[draft.identity]) {
+          Logger.log('[EventBus] 执行内去重命中，跳过: type=' + draft.type +
+            ' identity=' + draft.identity.slice(0, 12) + '...');
+          return;
+        }
+        _inExecIdentityCache_[draft.identity] = true;
+      }
+
+      var event = {
+        event_id: _generateEventId_(),
+        timestamp: new Date().toISOString(),
+        type: draft.type,
+        chat_id: draft.chatId || '',
+        payload: draft.payload || {},
+        source: draft.source || ''
+      };
+
+      rows.push([
+        event.event_id,
+        event.timestamp,
+        event.type,
+        event.chat_id,
+        JSON.stringify(event.payload),
+        event.source
+      ]);
+      published.push(event);
+    });
+
+    if (rows.length > 0) {
+      var sheet = _sheet_();
+      var startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, rows.length, COLS.length).setValues(rows);
+      _cachedEvents = null;
+    }
+
+    // 跟单条 publish() 保持一致：本项目没有自己的 ProjectionEngine，这个
+    // 检查会判否，安全跳过；写在这里是为了跟单条 publish() 行为对齐，
+    // 万一以后接了 ProjectionEngine，批量发布不会漏掉分发。
+    published.forEach(function (event) {
+      if (typeof ProjectionEngine !== 'undefined' && typeof ProjectionEngine.dispatch === 'function') {
+        try {
+          ProjectionEngine.dispatch(event);
+        } catch (projErr) {
+          Logger.log('[EventBus] Projection 失败（非致命）: ' + projErr.message);
+        }
+      }
+    });
+
+    return published;
+  }
+
   function getAllEvents() {
     if (_cachedEvents !== null) return _cachedEvents;
 
@@ -150,6 +236,7 @@ var EventBus = (function () {
 
   return {
     publish:         publish,
+    publishBatch:    publishBatch,
     getAllEvents:    getAllEvents,
     getEventsByType: getEventsByType
   };

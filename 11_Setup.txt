@@ -18,6 +18,17 @@
  * getWebhookInfo），其余逻辑逐字未改。完整决策依据见
  * 00_ADR_002_ReminderEngine_Audit_Fixes.txt。
  *
+ * 🐛 2026-07-10 第四轮外部审计关联（HIGH RISK 2，核实属实后采纳，完整
+ * 决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」）：
+ * runDiagnostics() 新增 checkReminders 名下 trigger 数量检查，其余逻辑
+ * 逐字未改。这里读的两个 Script Property 键名（
+ * REMINDER_ENGINE_RETRY_TRIGGER_ID / REMINDER_ENGINE_RETRY_COUNT）是
+ * 硬编码的字符串字面量，跟 2_Runtime/25_ReminderEngine.gs 里
+ * RETRY_FLAG_KEY/RETRY_COUNT_KEY 两个常量的实际值必须保持一致——这两个
+ * 常量是那个文件 IIFE 内部的私有变量，没有对外暴露，这里没有更干净的
+ * 引用方式，只能靠注释手动维护同步，如果以后改了那边的键名，要记得
+ * 回来同步这里。
+ *
  * Reminder OS v1.0 — 一键初始化
  *
  * ⚠️ 2026-07-03 拆分说明：新文件。Reminder OS 不需要建任何新表——它读写的
@@ -118,6 +129,26 @@ function runDiagnostics() {
     Logger.log('✅ QueryEngine.getPendingTasks() 测试结果，共 ' + pending.length + ' 条（全部用户）');
   } catch (e) {
     Logger.log('❌ QueryEngine.getPendingTasks() 报错: ' + e.message);
+  }
+
+  // 🐛 新增（2026-07-10，第四轮外部审计 HIGH RISK 2 关联，核实属实后
+  // 采纳）：checkReminders 名下当前的 trigger 数量。稳态应该只有1个
+  // （createTriggers() 建的每小时那个）。如果是2个，多半是恰好有一次
+  // 锁竞争重试在排队中（正常，见下面的 Script Property 是否也有记录）；
+  // 如果超过2个，或者下面显示没有重试记录但数量却大于1，说明大概率是
+  // 25_ReminderEngine.gs 的 _cleanupStaleRetryTrigger_ 没生效、trigger
+  // 在累积，需要手动排查——临时手段是重新跑一次本文件的 createTriggers()，
+  // 它会把 checkReminders 名下所有 trigger 清掉重建。
+  var reminderTriggers = ScriptApp.getProjectTriggers().filter(function (t) {
+    return t.getHandlerFunction() === 'checkReminders';
+  });
+  Logger.log((reminderTriggers.length === 1 ? '✅' : '⚠️') +
+    ' checkReminders 名下当前有 ' + reminderTriggers.length + ' 个 trigger（稳态应为1个）');
+  var retryTriggerId = PropertiesService.getScriptProperties().getProperty('REMINDER_ENGINE_RETRY_TRIGGER_ID');
+  var retryCount = PropertiesService.getScriptProperties().getProperty('REMINDER_ENGINE_RETRY_COUNT');
+  if (retryTriggerId || retryCount) {
+    Logger.log('ℹ️ 当前有锁竞争重试记录在案（trigger id=' + retryTriggerId + '，已重试次数=' +
+      (retryCount || '0') + '）——如果上面 trigger 数是2，大概率就是它，不算异常');
   }
 
   Logger.log('========== 诊断结束 ==========');

@@ -3,7 +3,10 @@
  * Reminder OS — 架构决策记录 #002
  *
  * STATUS: Accepted
- * DATE: 2026-07-06
+ * DATE: 2026-07-06（第一轮），后续三轮追加审计的核实+修复过程直接续在
+ * 同一份 ADR 里（第二轮/第三轮同为 2026-07-06，第四轮 2026-07-10）——
+ * 都是同一份审计对象（ReminderEngine 及其直接依赖）的持续复审，不是
+ * 独立决策，没有必要拆成 ADR-002a/002b/002c/002d 各自维护。
  */
 
 /**
@@ -360,4 +363,291 @@
  *   MEDIUM/LOW 各一条（JSON.parse未捕获、UrlFetchApp deadline参数）
  *   核实后发现审计描述/建议本身跟实际情况不符，没有改动；LOW RISK
  *   （TemporalEngine死代码）是已经记录过的刻意决定，不是新问题。
+ *
+ * === 第四轮外部审计（2026-07-10） ===
+ *
+ * Carson 提供了新一轮针对 2_Runtime/25_ReminderEngine.gs、2_Runtime/
+ * 20_EventBus.gs、2_Runtime/21_SheetUtils.gs、4_Integration/40_Output.gs、
+ * 0_Governance/00_Project_Constitution.gs 的外部审计报告，HIGH/MEDIUM/
+ * LOW 各两到三条。跟前三轮一样的方法：逐条核实是否属实，属实的按严重
+ * 程度修复，不属实或不适合直接修的说明理由，不盲目照抄审计给的修复
+ * 方案——这一轮有两条（MEDIUM RISK 1、HIGH RISK 3）审计给的具体修法
+ * 如果照字面直接实现，会引入比原问题更麻烦的新风险，处理方式见下面
+ * 对应条目。
+ *
+ * HIGH RISK 1（checkReminders 循环内逐条同步写 Events 表）
+ *   核实：属实。_recordReminderSent 每次被调用（即每成功发送一条提醒）
+ *   都会同步调 EventBus.publish，其内部是同步 appendRow()，单行 I/O。
+ *   Tasks 表那条线第一轮就批量化了（HIGH RISK 1，第一轮），但 Events
+ *   这条线当时没有一起改——检查了第一轮 ADR 记录，第一轮的改动范围
+ *   确实只提到 Tasks 表的批量写，Events 这条线从一开始就是遗漏，不是
+ *   后续哪一轮改坏的。
+ *   修复：20_EventBus.gs 新增 publishBatch(eventDrafts)，一次
+ *   getRange(...).setValues(...) 写入多行连续记录，取代逐条 appendRow。
+ *   _recordReminderSent 改成只把事件草稿 push 进调用方传入的
+ *   pendingEvents 数组（纯内存操作，不再有任何 I/O），checkReminders
+ *   跟 Tasks 批量写（pendingWrite/_persistBatch）用同一套分批节奏——
+ *   凑够 BATCH_WRITE_CHUNK_SIZE 或循环结束时，先 _persistBatch 再
+ *   _publishPendingEvents。
+ *   顺带的行为调整（有意为之，写清楚是因为不是审计要求的，是我
+ *   （Claude）在实现过程中主动做的判断）：原来 EventBus.publish 抛错
+ *   会导致 _recordReminderSent 提前中断，连带这条任务也不会被
+ *   push 进 pendingWrite——也就是"Events 写失败会拖累 Tasks 状态也不
+ *   落盘"，两者是意外耦合在一起的，不是设计出来的行为。现在两者解耦：
+ *   _publishPendingEvents 内部把异常吞掉、只记日志，不会影响
+ *   _persistBatch 那边已经成功的写入，理由是 Events 表本来的定位就是
+ *   "尽力而为的审计记录"（20_EventBus.gs 文件头原话），不应该反过来
+ *   拖累 reminder_count/last_reminder_at 这个驱动"还要不要提醒"判断
+ *   的功能性状态。
+ *
+ * HIGH RISK 2（一次性重试 trigger 没有清理，累积逼近20个 trigger 硬配额）
+ *   核实：属实。查了 GAS 平台上"一次性 trigger 执行完不会自动从
+ *   ScriptApp.getProjectTriggers() 消失"这个行为——这是社区广泛报告、
+ *   处理这类"续跑"trigger 的通用做法就是显式删除（不管是在下一次运行
+ *   开始时删，还是任务彻底完成时删），不是本项目独有的猜测。
+ *   _scheduleRetryOnce（第三轮新增）创建 trigger 之后没有任何清理逻辑，
+ *   随着锁竞争反复发生，这类 trigger 会不断累积。
+ *   修复：
+ *     1. _scheduleRetryOnce 改名 _scheduleRetry_，创建 trigger 后把
+ *        .create() 返回对象的 getUniqueId() 存进 RETRY_FLAG_KEY（这个
+ *        Script Property 原本存的是时间戳字符串，纯粹当布尔标记用，现在
+ *        改存 trigger 的 uniqueId，一并解决 LOW RISK 2，见下）。
+ *     2. 新增 _cleanupStaleRetryTrigger_，读 RETRY_FLAG_KEY，如果有值，
+ *        遍历 ScriptApp.getProjectTriggers() 找到匹配的 trigger 并
+ *        ScriptApp.deleteTrigger()，然后清掉这条 Property。deleteTrigger
+ *        包了 try/catch——如果 trigger 已经不存在（比如两次调用竞态），
+ *        忽略即可，不应该让 checkReminders 因为清理一个"已经不在了"的
+ *        trigger 而报错中断。
+ *     3. _cleanupStaleRetryTrigger_ 放在 checkReminders 最开头、
+ *        无条件调用——不判断这次执行是不是由重试 trigger 触发的，也不
+ *        等这次执行成功拿到锁才清理。这样即使出现"重试 trigger 触发后，
+ *        这次恰好又没拿到锁"（LOW RISK 2 描述的场景）的情况，那个已经
+ *        完成使命的 trigger 也会在它触发的这次执行里被清理掉，不会因为
+ *        这次也没拿到锁就被漏掉、继续累积。
+ *     4. 1_Foundation/11_Setup.gs 的 runDiagnostics() 新增
+ *        checkReminders 名下 trigger 数量检查（稳态应为1个），配合
+ *        Script Property 是否有重试记录一起判断当前是否正常，作为部署
+ *        时/怀疑累积时的手动排查手段——跟 MEDIUM RISK 1（第一轮）的
+ *        webhook 诊断是同一种"没法自动兜底、但至少能被人工发现"的处理
+ *        思路。
+ *
+ * HIGH RISK 3（时间预算检查粒度不够，单次 UrlFetchApp 最坏耗时可能让单次
+ * 迭代自己就突破6分钟硬上限）
+ *   核实：属实。EXECUTION_TIME_BUDGET_MS 的检查（第二轮引入）只发生在
+ *   每次处理任务【之前】，检查通过之后才进入的这一条任务，处理过程本身
+ *   （尤其是 Output.sendMessage 里的 UrlFetchApp.fetch）可能耗时接近
+ *   UrlFetchApp 的平台内建上限（第三轮已查证，约60秒，不可配置）——
+ *   哪怕预算检查那一刻显示"还有余量"，只要接下来这一条任务恰好撞上
+ *   最坏情况，单次迭代自己就可能吃掉超过原本预留的1分钟安全余量，把
+ *   总耗时推过6分钟硬上限，进程被 GAS 强制终止，已发送但还没来得及
+ *   批量写入的状态会彻底丢失。
+ *   另外查证了一个关联信息：GAS 官方文档说 LockService 的锁会在脚本
+ *   执行结束时自动释放，但也有开发者社区反馈"如果脚本是被强制终止
+ *   （而不是正常执行完/正常抛异常）的，锁有没有可靠释放存在不确定性"
+ *   ——这不是本次审计报告提到的点，是我在查证过程中顺带注意到的，
+ *   记在这里：如果这个不确定性真的发生（脚本因为超时被强制杀死、锁没
+ *   释放），会导致下一个整点触发器也拿不到锁，跟本条修复的方向是一致
+ *   的——都是"应该主动避免真的撞到6分钟硬上限"，不是两个独立问题。
+ *   修复：
+ *     1. EXECUTION_TIME_BUDGET_MS 不再是一个直接写死的"5分钟"，改成
+ *        显式公式：硬上限(6分钟) − 最坏情况单任务耗时(UrlFetchApp最坏
+ *        ~60秒 + 固定节流 + 批量持久化余量~10秒) − 额外安全垫(20秒)，
+ *        算出来约等于4分29秒，比原来的5分钟更保守。用公式而不是直接
+ *        改一个数字，是为了让"这个数字为什么是这个数字"能在代码里
+ *        直接读出来，不需要回来翻这份 ADR 才知道 269000 是怎么来的。
+ *     2. BATCH_WRITE_CHUNK_SIZE 从20降到5，缩小"已发送但未持久化"的
+ *        风险窗口。这一步能做（而且做的代价可控），是因为同一轮里
+ *        MEDIUM RISK 1（见下）把 _persistBatch 的单次成本从"正比于
+ *        表总行数"降到"正比于本批大小"——如果没有先修 MEDIUM RISK 1，
+ *        单独把 chunk size 从20调到5会让"整表读写"的次数从5次变成
+ *        40次，是不划算的；两者放在同一轮一起做，互相成为对方能往前
+ *        走一步的前提。
+ *   ⚠️ 已知局限：这两步只能【缩小】风险窗口，不能【消除】——GAS 平台
+ *   本身不提供配置/缩短 UrlFetchApp 超时的手段，也没有办法在预算检查
+ *   那一刻预知"接下来这条任务会不会恰好撞上最坏情况"。这是当前 GAS
+ *   平台限制下能做到的合理程度的缓解，跟第三轮 LOW RISK（UrlFetchApp
+ *   deadline参数不存在）那条的结论是一致的。
+ *
+ * MEDIUM RISK 1（batchUpsertRowsByKey_ 每次调用都整表读+整表写，分批
+ * 持久化时被重复调用多次，成本正比于表总行数而不是本批大小）
+ *   核实：属实。batchUpsertRowsByKey_ 每次调用确实会
+ *   getRange(2,1,lastRow-1,numCols).getValues() 读整张表、合并字段后
+ *   getRange(2,1,existingRows.length,numCols).setValues(...) 整表写回，
+ *   _persistBatch 分批调用它（第三轮引入，每批最多20个已发送任务写
+ *   一次）意味着这个"整表读+整表写"的成本会在同一次 checkReminders
+ *   执行里被重复付出多次。
+ *   审计给的修复建议是"在内存中完成所有分批计算和状态累加，整个执行
+ *   周期结束前只读写一次"——评估后【没有照字面实现这个建议】，理由：
+ *   这等于把持久化改回第二轮"循环结束才写一次"的做法，而第三轮 HIGH
+ *   RISK 1 已经明确论证过并改掉了这个做法（一次性写入失败/被中断，
+ *   会导致整批状态全部丢失）；如果为了消除"重复整表读写"而重新引入
+ *   "单点写入失败牵连全部"的风险，是拿一个已经修好的问题去换这个
+ *   性能问题，不划算。
+ *   进一步评估了"缓存一次读取结果、跨多次分批调用重复使用"这个折中
+ *   方案，也没有采用：Reminder OS 和 Productivity OS 是两个独立的 GAS
+ *   项目，各自的 LockService 互不感知对方，本项目的锁只保证"同一时间
+ *   只有一个 checkReminders 在跑"，不能阻止 Productivity OS（或用户
+ *   直接在 Sheet UI 操作）在 checkReminders 执行期间（分批持久化跨越
+ *   好几分钟）并发修改 Tasks 表。如果缓存一份"现有行数据"跨多次调用
+ *   重用、最后再整表覆写，一旦 Productivity OS 在这期间改了某个不相关
+ *   字段（比如用户改了任务标题），本项目基于缓存旧数据的整表覆写会把
+ *   那次改动悄悄覆盖掉——等于用"偶发重复提醒"的性能问题去换"偶发数据
+ *   丢失"的正确性问题，同样不划算。
+ *   实际修复：21_SheetUtils.gs 新增 batchUpdateFieldsByKey_，操作形状
+ *   跟 batchUpsertRowsByKey_ 不同——只读 keyHeader 这一列定位行号（不读
+ *   其余列），只对实际要改的字段做单元格级 setValue()（不做整行/整表
+ *   setValues()），不支持"找不到就插入"（找不到记进返回值的 notFound
+ *   数组，交给调用方判断）。这样读的宽度从 numCols 列降到1列，写的范围
+ *   从"整张表"降到"本批实际改动的单元格"，两者都不再随表的总行数/
+ *   总列数线性增长；同时因为每次调用仍然是【当次】重新读1列（不跨调用
+ *   缓存），也仍然保留了"基于足够新鲜的数据做判断"这个安全性质——
+ *   跟上一段分析的两个被否决方案的关键区别就在这里。_persistBatch 改
+ *   调这个新函数，batchUpsertRowsByKey_ 本身不变，继续保留给真正需要
+ *   "找不到就插入"语义的场景（比如以后真的有整表重建需求）。
+ *
+ * MEDIUM RISK 2（_sendReminder 网络抖动可能导致"已送达但状态未落盘"的
+ * 偶发重复发送）
+ *   核实：属实。Output.sendMessage 已经设置 muteHttpExceptions:true
+ *   （非2xx状态码不会抛异常，会正常返回），但如果 Telegram 已经收到
+ *   并处理了请求（消息确实已经送达），只是返回响应的路上网络抖动/超时，
+ *   UrlFetchApp.fetch 仍然会抛异常，进 catch 分支返回 {ok:false}——
+ *   checkReminders 据此判定"发送失败"，不更新 reminder_count/
+ *   last_reminder_at，下次触发器会重新判定需要提醒，造成重复发送。
+ *   评估是否能在代码层面修复，查证了两个关键事实：
+ *     1. UrlFetchApp 没有任何手段区分"请求根本没打到"（DNS失败/连接被
+ *        拒绝，消息确定没发出去）和"打到了、处理了，但响应丢了"（消息
+ *        可能已经送达）——没有请求ID，没有"查询这次请求实际状态"的
+ *        旁路接口。
+ *     2. 查了 Telegram Bot API 的官方 GitHub issue tracker：
+ *        "Idempotence for method calls"是一个长期开放、至今没有实现的
+ *        feature request——sendMessage 这类方法调用不支持幂等键/去重
+ *        token，Telegram 服务端没有提供"同一个请求重复发送只生效一次"
+ *        的机制。
+ *   两个平台（GAS 和 Telegram Bot API）都不提供解决这个问题所需的手段，
+ *   不是本项目代码层面能修的问题——这跟第三轮"UrlFetchApp deadline参数
+ *   不存在"那条性质类似：审计指出的现象是真的，但建议隐含的"这能被修好"
+ *   前提不成立。
+ *   处理方式（不是"修复"，是"业务层面接受+诊断增强"，采纳的正是审计
+ *   建议本身给出的方向）：40_Output.gs 的 catch 分支新增
+ *   ambiguousDelivery:true 标记，跟其他明确的业务失败（比如 Telegram
+ *   明确返回 chat not found）区分开，方便以后翻日志排查偶发重复发送时
+ *   一眼看出是不是这种"响应丢失"情况。这个标记只是诊断辅助，不改变
+ *   "发送失败就不更新状态"这个既有判断逻辑，也不会减少重复发送本身的
+ *   概率——完整认定见 00_Project_State.gs「已知问题」。
+ *
+ * LOW RISK 1（00_Project_Constitution.gs 对 Tasks 表结构强耦合，违反
+ * 开闭原则，建议引入抽象层/数据字典映射）
+ *   核实：技术观察本身没错——_shouldRemind/_buildReminder 等确实是围绕
+ *   task_id/priority/status/due_date 这些字段名硬编码的。但这不是一个
+ *   新问题，也不是这次审计发现的：00_Project_Constitution.gs P1 从
+ *   2026-07-03 拆分时就明确写了"未来 Property/Finance/Vehicle OS 只要
+ *   往共享 Spreadsheet 写自己的表，这个项目加一段'也查那张表'的逻辑，
+ *   就能复用同一套提醒/通知机制"——这是一个已经想清楚、已经落笔的方案，
+ *   只是方向跟这次审计建议的"抽象一层通用接口"不一样。
+ *   评估是否应该改用审计建议的方案：没有采纳，按
+ *   00_ADR_003_Reminder_OS_V2_Vision_Evaluation.gs 里的 Progression
+ *   Rule（不为还没出现的真实需求预先设计）——在 Property/Finance/
+ *   Vehicle OS 里任何一个真的接入之前，没有第二个真实案例可以验证
+ *   "抽象接口该长什么形状"才是对的，现在设计出来的任何通用接口都是
+ *   凭空猜的，猜错的代价（接入第一个真实新 Domain OS 时发现抽象层设计
+ *   跟实际需求对不上，需要推翻重来）不比"现在不抽象、以后加一段查询
+ *   逻辑"更小。这跟 00_ADR_004 里"决定不为 Foundation 模块另开
+ *   ADR-005"的理由是同一类判断。
+ *   处理方式：00_Project_Constitution.gs P1 补充一段"2026-07-10 核实"
+ *   记录这次复审的结论，不改变 P1 原有方案本身。
+ *
+ * LOW RISK 2（锁竞争时，如果第一次重试本身也遇到锁竞争，不会安排第二次
+ * 重试，导致延迟接近整点触发器的一小时周期，重试机制在这种场景下形同
+ * 虚设）
+ *   核实：属实，逐步走查了 _scheduleRetryOnce/RETRY_FLAG_KEY 的完整
+ *   状态机确认：RETRY_FLAG_KEY 只有在 checkReminders【成功拿到锁】之后
+ *   才会被清掉。如果第一次重试（5分钟后触发）本身也因为前一个实例还没
+ *   跑完而拿不到锁，会再次进入"拿不到锁"的分支，此时标记还在（因为这次
+ *   同样没有走到"清掉标记"那一步），于是被当成"已经排过重试了"直接
+ *   放弃，不会安排第二次重试——变成要等下一个整点触发器，最坏延迟接近
+ *   整整一小时，第三轮引入这个重试机制本来要解决的问题在这种场景下
+ *   基本没解决。
+ *   修复：把"布尔标记、只重试1次"改成"计数器、最多重试
+ *   MAX_RETRY_ATTEMPTS(=2)次"——RETRY_COUNT_KEY 记录当前这一轮锁竞争
+ *   已经重试了几次，只在成功拿到锁之后才清零，达到上限才真正放弃退回
+ *   等下一个整点。这个数值本身是折中，不是精确计算出来的：没有做成
+ *   "无限重试直到成功"，因为那样会失去锁竞争约束原本要防的东西（同一个
+ *   函数的执行互相越叠越多，第三轮引入"只重试1次"就是为了避免这个）；
+ *   2次覆盖了"两次都刚好撞上"这种更极端的场景，但仍然是有限次数，
+ *   具体数字见 00_Project_State.gs「下一步」，按实际观察到的运行情况
+ *   可以调整。
+ *   这条修复用的 RETRY_FLAG_KEY 跟 HIGH RISK 2 的 trigger 清理共享同一个
+ *   Script Property（现在存 trigger 的 uniqueId），两条修复在实现上是
+ *   交织在一起的，不是各自独立的两处改动——具体设计见
+ *   2_Runtime/25_ReminderEngine.gs 里 RETRY_FLAG_KEY/RETRY_COUNT_KEY/
+ *   _cleanupStaleRetryTrigger_/_scheduleRetry_ 几处的注释。
+ *
+ * === 第四轮验证方式 ===
+ *
+ * 用 Node.js 的 vm 模块搭了一套 mock GAS 环境（SpreadsheetApp/Sheet/
+ * Range 用内存二维数组模拟，PropertiesService 用内存对象模拟，ScriptApp
+ * 的 trigger 用带 uniqueId 的数组模拟且 deleteTrigger 对不存在的 id 会
+ * 报错——特意模拟这个报错行为，是为了验证 _cleanupStaleRetryTrigger_
+ * 的 try/catch 真的有必要、真的生效；UrlFetchApp/LockService 的行为
+ * 可以按测试场景注入），把这四个改动过的 .gs 文件源码原样加载进去跑，
+ * 不是重新拿 JS 实现一遍"我觉得代码应该做的事"再测那份实现。
+ *
+ * 新写 6 组针对第四轮改动的场景测试：
+ *   1. 12条提醒全部发送成功（batch chunk size=5，应该分3批 5+5+2）时，
+ *      验证 Events 表的写入调用次数等于批数（3次），不是逐条12次调用，
+ *      且不再出现旧版的单行 appendRow 调用
+ *   2. 完整模拟"锁竞争→重试1→仍然锁竞争→重试2→仍然锁竞争→放弃"这一条
+ *      链路：验证每一步 trigger 是否被正确创建/清理、Script Property
+ *      里的 trigger id 和重试计数是否符合预期、达到 MAX_RETRY_ATTEMPTS
+ *      后确实不再继续排队、且最终锁恢复可用时能正常执行并清空所有
+ *      重试相关状态
+ *   2b. 单独验证清理一个已经不存在的 trigger id 不会抛出未捕获异常
+ *   3a. 直接从源码摘出 EXECUTION_TIME_BUDGET_MS/BATCH_WRITE_CHUNK_SIZE/
+ *      MAX_RETRY_ATTEMPTS 的定义原样求值，验证算出来的具体数值符合预期
+ *      方向（预算比原来更保守、chunk size比原来更小、重试次数比原来更多），
+ *      不是凭感觉看代码"觉得对"
+ *   3b. 模拟第3条任务处理耗时暴涨（模拟 UrlFetchApp 撞上最坏情况），验证
+ *      预算检查在下一次迭代开始前正确生效、提前中断循环，已处理的3条
+ *      状态确实落盘，未处理的不会被误改
+ *   4. 200行的大表场景下，验证批量持久化不再出现"整表读"/"整表写"
+ *      （只有 QueryEngine 既有的1次整表读，属于不在本轮修改范围内的
+ *      已知行为），改成"只读1列定位行号"+"逐字段定点 setValue"，且最终
+ *      数据结果本身是对的（200行全部正确更新，未改动字段没有被误覆盖）
+ *   4b. 单独验证 batchUpdateFieldsByKey_ 对不存在的 key 不会静默 append
+ *      新行，而是记进 notFound
+ *   5. 验证 Output.sendMessage 在 UrlFetchApp 抛异常时标记
+ *      ambiguousDelivery:true，在 Telegram 明确返回业务失败时不标记
+ *      （对照组，确认标记不会被滥用到所有失败情况上）
+ * 全部 39 个断言通过。
+ *
+ * 另外新写 8 组回归测试，覆盖前三轮已经修复、这次改动路径上有交叉的
+ * 关键行为，确认没有被破坏：REMINDER_ADVANCE_HOURS 提前量判断、
+ * last_reminder_at 确实落盘（第二轮那个"从未生效"的 bug 不能重新出现）、
+ * 发送失败时不更新任何状态、单任务异常不拖累其他任务、OVERDUE 24小时
+ * 强制间隔、简单的单次锁竞争重试链路端到端可用、EventBus 原有的单条
+ * publish() 不受 publishBatch 新增影响、_persistBatch 失败重试机制在
+ * 换成新的 batchUpdateFieldsByKey_ 之后依然按预期工作。全部 18 个断言
+ * 通过。
+ *
+ * === 第四轮后果 ===
+ *
+ * - 2_Runtime/25_ReminderEngine.gs：_recordReminderSent 不再直接调
+ *   EventBus.publish，改为写入 pendingEvents 缓冲区；新增
+ *   _cleanupStaleRetryTrigger_；_scheduleRetryOnce 改名 _scheduleRetry_
+ *   并支持有限次数重试；EXECUTION_TIME_BUDGET_MS 改为公式推导；
+ *   BATCH_WRITE_CHUNK_SIZE 20→5；_persistBatch 改调
+ *   batchUpdateFieldsByKey_。
+ * - 2_Runtime/20_EventBus.gs：新增 publishBatch，原 publish 不变。
+ * - 2_Runtime/21_SheetUtils.gs：新增 batchUpdateFieldsByKey_，原
+ *   batchUpsertRowsByKey_ 不变。
+ * - 4_Integration/40_Output.gs：catch 分支新增 ambiguousDelivery 诊断
+ *   标记，不改变原有返回结构。
+ * - 1_Foundation/11_Setup.gs：runDiagnostics() 新增 trigger 数量检查。
+ * - 0_Governance/00_Project_Constitution.gs：P1 新增核实记录（结论
+ *   不变），P3 更新为定点字段更新+Events批量发布的描述。
+ * - MEDIUM RISK 2（Telegram 送达状态不确定导致的偶发重复发送）核实属实
+ *   但受限于 GAS 和 Telegram Bot API 两个平台都不提供解决所需的手段，
+ *   只做诊断增强，业务层面接受为"至少送达一次"语义下的偶发代价；
+ *   LOW RISK 1（Constitution 抽象层建议）核实后确认不是新问题，是已有
+ *   决定的重新核实，结论不变，理由见 P1 的核实记录和 Progression Rule。
  */

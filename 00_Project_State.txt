@@ -3,7 +3,11 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-06 — 修复上一轮 HIGH RISK 2；按 Domain OS
+ * LAST_UPDATED: 2026-07-10 — 修复第四轮外部审计发现的 HIGH RISK 1/2/3、
+ * MEDIUM RISK 1 共4项；核实 MEDIUM RISK 2（Telegram 送达状态不确定导致
+ * 的偶发重复发送）和 LOW RISK 1（Constitution 抽象层建议）属实但不适合
+ * /不需要代码修复，理由见「已知问题」和 00_Project_Constitution.gs P1。
+ * 2026-07-06 — 修复上一轮 HIGH RISK 2；按 Domain OS
  * Blueprint 重组全部文件；15_Setup.gs 内容不符问题已收到真实代码并替换
  * 确认；修复第一轮外部审计的 HIGH RISK 1/2、MEDIUM RISK 1/2、
  * LOW RISK 1/2 共6项；完成 Phase A（Temporal Engine）Contract 设计+
@@ -140,6 +144,52 @@
  *   新写4组测试（分批写验证、批量写失败重试验证、lock重试排队去重
  *   验证、正则拆分验证），第二轮遗留的5组测试补上新增的
  *   PropertiesService/ScriptApp mock 后重新跑通，确认无回归。
+ *
+ * - 2026-07-10：修复第四轮外部审计发现，完整依据见
+ *   00_ADR_002_ReminderEngine_Audit_Fixes.gs 的「第四轮外部审计」章节：
+ *   · HIGH RISK 1（新）：checkReminders 循环里每发送成功一条提醒就立刻
+ *     调 EventBus.publish（同步单行 appendRow）写 Events 表——Tasks 表
+ *     那条线第一轮就批量化了，Events 这条线一直没跟上，是本该一起做
+ *     但当时没做的遗漏。新增 EventBus.publishBatch，改成跟 Tasks 批量写
+ *     用同一套分批节奏。
+ *   · HIGH RISK 2（新）：_scheduleRetryOnce 建的一次性重试 trigger，
+ *     执行完不会自动从 ScriptApp.getProjectTriggers() 消失，需要显式
+ *     删除，否则持续累积会逼近单项目最多20个已安装 trigger 的硬配额。
+ *     新增 _cleanupStaleRetryTrigger_，在 checkReminders 最开头无条件
+ *     调用，删掉上一次留下的 trigger；11_Setup.gs 的 runDiagnostics()
+ *     同步新增 trigger 数量检查。
+ *   · HIGH RISK 3（新）：EXECUTION_TIME_BUDGET_MS 的检查只发生在每次
+ *     处理任务之前，UrlFetchApp.fetch 最坏情况单次卡住约60秒（第三轮已
+ *     查证的 GAS 平台限制）不受这个检查约束，理论上可能让单次循环迭代
+ *     自己就撞上6分钟硬上限。改成显式按"硬上限−最坏情况单任务耗时−
+ *     安全垫"重新推导预算（不是简单改小数字），配合 MEDIUM RISK 1
+ *     把持久化成本降下来后，同步把 BATCH_WRITE_CHUNK_SIZE 从20降到5，
+ *     缩小"已发送但未持久化"的风险窗口。这个风险只能缓解、不能消除，
+ *     GAS 平台本身不提供配置 UrlFetchApp 超时的手段。
+ *   · MEDIUM RISK 1：_persistBatch 之前调用的 batchUpsertRowsByKey_
+ *     每次都整表读+整表写，成本随 Tasks 表总行数增长——5批×100条更新
+ *     会把整张表重复读写5次。21_SheetUtils.gs 新增
+ *     batchUpdateFieldsByKey_，只读 key 列定位行号、只对实际改动的字段
+ *     做单元格级定点写入，成本正比于本批大小，不再随表总行数增长。
+ *   ⚠️ 这轮审计另外两条，核实属实但不适合/不需要代码修复：
+ *   · MEDIUM RISK 2（_sendReminder 网络抖动导致偶发重复发送）：查证
+ *     UrlFetchApp 没有任何手段区分"没发出去"和"发出去了但响应丢失"，
+ *     Telegram Bot API 的 sendMessage 也不支持幂等键（官方 Bot API 的
+ *     issue tracker 上这是一个至今没有实现的 open feature request）。
+ *     两个平台都不提供解决这问题所需的手段，按审计建议本身的方向在
+ *     业务层面接受，只在 40_Output.gs 加了 ambiguousDelivery 诊断标记，
+ *     方便以后翻日志排查。见下面「已知问题」。
+ *   · LOW RISK 1（00_Project_Constitution.gs 对 Tasks 表结构耦合，
+ *     建议抽象层）：核实后发现不是新问题——Constitution P1 已经明确
+ *     记录了不同的、经过深思的方案（新 Domain OS 接入时"加一段查询
+ *     逻辑"，不是抽象一层通用接口），这次审计建议的做法方向相反。按
+ *     Progression Rule 维持 P1 现状，见
+ *     00_Project_Constitution.gs P1 的 2026-07-10 核实记录。
+ *   4组新场景测试（Events批量写节奏、trigger清理+有限次数重试、时间
+ *   预算提前中断、批量持久化只读写必要范围）+ notFound边界情况，加上
+ *   8组回归测试（提前量判断/last_reminder_at落盘/发送失败不改状态/
+ *   单任务异常隔离/OVERDUE间隔/简单锁重试链路/EventBus单条publish不受
+ *   影响/_persistBatch失败重试）全部通过，确认无回归。
  */
 
 // ============================================================
@@ -196,6 +246,20 @@
  *     自己写的字段要不要跟着换写入目标），这些都要看 Productivity OS
  *     的代码才能确认，这次没有拿到。如果 Carson 能提供 Productivity OS
  *     关于 ActiveTasks 的代码，我可以评估切换的可行性。
+ *
+ * - 【第四轮审计核实属实、决定不修/无法从代码层面消除，理由见
+ *   ADR-002「第四轮外部审计」】
+ *   · MEDIUM RISK 2：_sendReminder 发消息时，如果 Telegram 已经收到并
+ *     处理（消息已送达），但返回响应的路上网络抖动/超时，UrlFetchApp
+ *     会抛异常，本项目会把这次当发送失败处理，不更新提醒状态，下次
+ *     触发器可能重复发送。已查证 UrlFetchApp 没有任何手段区分"没发出去"
+ *     和"发出去了但响应丢失"，Telegram Bot API 的 sendMessage 也不支持
+ *     幂等键/去重 token（这是官方 Bot API issue tracker 上一个至今没有
+ *     实现的 open feature request）——两个平台都不提供解决这个问题
+ *     所需的手段，不是本项目代码层面能修的问题。已经按审计建议本身的
+ *     方向在业务层面接受这是"至少送达一次"语义下的偶发代价，
+ *     40_Output.gs 的 catch 分支加了 ambiguousDelivery 标记，方便以后
+ *     翻日志时把这种情况跟其他真实发送失败区分开，仅此而已。
  */
 
 // ============================================================
@@ -228,9 +292,22 @@
  *      （见 00_ADR_003 Progression Rule），不是漏接。真的需要"每周一
  *      提醒我"这类 recurring 提醒时，下一步是 Phase B（Reminder
  *      Scheduler）——但要等到那时候再单独设计，不是现在顺手就接上。
+ *   7. 第四轮新增两个数值，都是 Claude 按推导/折中选的，不是从你的
+ *      文档/代码反推出来的既定值，按实际观察到的运行情况调整即可，不
+ *      影响判断逻辑本身：
+ *      - BATCH_WRITE_CHUNK_SIZE=5（原20）：折中——明显收窄"已发送但未
+ *        持久化"的风险窗口，同时没让持久化调用次数增长到跟发送条数
+ *        一样多。如果实际提醒条数一直很大（比如经常一次触发要发几十上
+ *        百条），可以适当调大；如果几乎不会同时有超过5条待发，也可以
+ *        调小甚至改成每发一条就持久化一次。
+ *      - MAX_RETRY_ATTEMPTS=2（原隐含1）：折中——覆盖"两次都刚好撞上
+ *        锁竞争"这种更极端场景，但仍然是有限次数，没有做成无限重试。
+ *        如果实际观察到 checkReminders 经常需要跑很久（导致连续几次
+ *        重试都撞上），可以考虑调大，但要注意这不是免费的——重试次数
+ *        越多，锁竞争没解决时的总占用时间越长。
  *
  * 优先级 P3（架构演进）：
- *   7. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
+ *   8. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
  *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
  *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
  */

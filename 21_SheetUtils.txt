@@ -2,6 +2,41 @@
  * 21_SheetUtils.gs   [原 05_SheetUtils.gs — 2026-07-06 按 Domain OS
  * Blueprint 迁入 2_Runtime/。这个文件横跨多个子分类，没有拆分，见
  * 00_ADR_001_Domain_OS_Blueprint_Adoption.txt 的说明：
+ *
+ * 🐛 2026-07-10 第四轮外部审计修复（MEDIUM RISK 1，核实属实后采纳，完整
+ * 决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」）：
+ * 新增 batchUpdateFieldsByKey_()。25_ReminderEngine.gs 的 _persistBatch
+ * 之前复用 batchUpsertRowsByKey_ 做分批持久化——但那个函数是为"批量
+ * 建/改任意字段、找不到就 append"场景设计的通用 upsert，每次调用都会
+ * 整表读（getRange(2,1,lastRow-1,numCols)）+ 整表写（setValues 覆盖全部
+ * 现有行），成本随表的总行数增长，而不是随本批实际改动的行数增长。
+ * Reminder OS 每次持久化只需要更新【已确定存在】的任务的 reminder_count/
+ * last_reminder_at 两个字段，不需要 upsert 的"找不到就插入"语义，也不
+ * 需要整表覆写——这是一个更窄、更适合"稀疏字段更新"的操作形状，所以新增
+ * 一个独立函数而不是改造 batchUpsertRowsByKey_ 本身（改造会让那个函数
+ * 同时承担两种不同的成本模型，其他调用方——如果未来出现整表重建场景——
+ * 会意外变慢）。
+ *
+ * batchUpdateFieldsByKey_ 只读 key 列定位行号（不读其余列），只对
+ * 实际要改的字段做单元格级 setValue()（不做整行/整表 setValues()）——
+ * 读的宽度从 numCols 列降到 1 列，写的范围从"整张表"降到"本批实际改动
+ * 的单元格"，两者都不再随表的总行数/总列数线性增长。
+ *
+ * ⚠️ 刻意不做的优化：没有把"读 key 列定位行号"这一步也跨多次调用缓存
+ * 起来（比如整个 checkReminders 执行期间只读一次）。原因：Reminder OS
+ * 和 Productivity OS 是两个独立的 GAS 项目，各自的 LockService 互不
+ * 感知对方——本项目的锁只保证"同一时间只有一个 checkReminders 在跑"，
+ * 不能阻止 Productivity OS（或用户直接在 Sheet UI 里操作）在
+ * checkReminders 执行期间（分批持久化跨越好几分钟）并发修改 Tasks 表。
+ * 如果缓存一份行号映射跨多次调用重用，理论上没问题（行号本身不受这
+ * 次改动影响——只要没有物理插入/删除行）；但如果改成像
+ * batchUpsertRowsByKey_ 那样缓存整份"现有行数据"再整表覆写，一旦
+ * Productivity OS 在这期间改了某个不相关字段（比如用户改了任务标题），
+ * 本项目基于缓存旧数据的整表覆写会把那次改动悄悄覆盖掉——用"偶发重复
+ * 提醒"的性能问题去换"偶发数据丢失"的正确性问题，不是划算的交易。新
+ * 函数每次调用都重新读 key 列（成本已经压得很低），只对自己要改的具体
+ * 单元格做定点写入，不接触任何其他字段，天然规避了这个风险，不需要
+ * 额外加缓存失效逻辑。
  *   - Runtime/Projection（主）：upsertRowByKey_ / deleteRowByKey_ /
  *     batchUpsertRowsByKey_ —— 维护 Tasks 等派生视图表
  *   - Runtime/Decision 支撑：isOverdue_ / parseDueDate_ —— 供
@@ -296,6 +331,86 @@ var SheetUtils = (function () {
     return { updated: updated, appended: appended };
   }
 
+  /**
+   * 🐛 2026-07-10 第四轮外部审计新增（MEDIUM RISK 1，核实属实后采纳，
+   * 完整决策依据见 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」，
+   * 也见本文件头的说明）。
+   *
+   * 批量【稀疏字段更新】：只更新已知存在的行的指定字段，不做整表读/写，
+   * 不支持"找不到就插入"（找不到直接跳过，记录进返回值的 notFound
+   * 数组，交给调用方决定怎么处理——对 Reminder OS 来说，"任务已经从
+   * QueryEngine.getPendingTasks() 读出来了，几分钟后持久化时却在 Tasks
+   * 表里找不到对应行"本身就是一种值得留意的异常情况，不应该静默 append
+   * 一行不完整的新数据）。
+   *
+   * 跟 batchUpsertRowsByKey_ 的关键差异：
+   *   - 读：只读 keyHeader 这一列（1列 × N行），不读整表（numCols列 × N行）
+   *   - 写：对每一行只 setValue() 实际改动的那几个字段对应的单元格，
+   *     不做整行/整表 setValues()——不会读取也不会覆盖同一行里没有指定
+   *     的其他字段
+   *   - 语义：找不到 key 就跳过，不 append 新行
+   *
+   * @param {string} sheetName
+   * @param {string} keyHeader          用来定位行的列名，比如 'task_id'
+   * @param {object[]} rowDataObjArray  每个元素是 { [keyHeader]: value, 要改的字段: 新值, ... }
+   *                                    只会写明确给出的字段，未列出的字段不受影响。
+   * @returns {{updated:number, notFound:Array}}
+   */
+  function batchUpdateFieldsByKey_(sheetName, keyHeader, rowDataObjArray) {
+    if (!rowDataObjArray || rowDataObjArray.length === 0) {
+      return { updated: 0, notFound: [] };
+    }
+
+    var sheet = getSheet_(sheetName);
+    var headerMap = getHeaderMap_(sheet);
+
+    if (!(keyHeader in headerMap)) {
+      throw new Error('找不到列: ' + keyHeader + '，请确认 ' + sheetName + ' 表头里有这一列');
+    }
+
+    var keyColIndex = headerMap[keyHeader];
+    var lastRow = sheet.getLastRow();
+
+    // 只读 key 这一列（不是整表），定位每个 keyValue 对应的实际行号（1基）
+    var rowNumByKey = {};
+    if (lastRow >= 2) {
+      var keyValues = sheet.getRange(2, keyColIndex + 1, lastRow - 1, 1).getValues();
+      for (var i = 0; i < keyValues.length; i++) {
+        var k = keyValues[i][0];
+        if (k !== '' && k !== null && k !== undefined) {
+          rowNumByKey[String(k)] = i + 2; // +2：跳过表头 + 0基转1基
+        }
+      }
+    }
+
+    var updated = 0;
+    var notFound = [];
+
+    rowDataObjArray.forEach(function (rowDataObj) {
+      var keyValue = rowDataObj[keyHeader];
+      if (keyValue === undefined || keyValue === null || keyValue === '') return; // 没有主键值，跳过
+
+      var rowNum = rowNumByKey[String(keyValue)];
+      if (rowNum === undefined) {
+        notFound.push(keyValue);
+        return;
+      }
+
+      var touchedThisRow = false;
+      for (var field in rowDataObj) {
+        if (field === keyHeader) continue;
+        if (!headerMap.hasOwnProperty(field)) continue;
+        var val = rowDataObj[field];
+        sheet.getRange(rowNum, headerMap[field] + 1)
+          .setValue((val === null || val === undefined) ? '' : val);
+        touchedThisRow = true;
+      }
+      if (touchedThisRow) updated++;
+    });
+
+    return { updated: updated, notFound: notFound };
+  }
+
   // ============ 共用：过期判断 ============
   // 原本在92_ReminderEngine.gs里，21_InventoryModule.gs跨文件直接调用它的
   // 私有函数（_parseDueDate_），93_MemoryEngine.gs又自己重复实现了一份一样
@@ -386,6 +501,7 @@ var SheetUtils = (function () {
     upsertRowByKey_: upsertRowByKey_,
     deleteRowByKey_: deleteRowByKey_,
     batchUpsertRowsByKey_: batchUpsertRowsByKey_,
+    batchUpdateFieldsByKey_: batchUpdateFieldsByKey_,
     isOverdue_: isOverdue_,
     parseDueDate_: parseDueDate_,
     round1_: round1_,

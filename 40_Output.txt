@@ -7,6 +7,23 @@
  *
  * 架构铁律（00_Project_Constitution.gs P5）：
  *   任何模块要给用户发消息，必须经过这里，不允许自己调 Telegram API。
+ *
+ * 🐛 2026-07-10 第四轮外部审计关联（MEDIUM RISK 2，核实属实，评估后不做
+ * 功能性修复，只加诊断标记，完整决策依据见
+ * 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」）：
+ * sendMessage 请求已经打到 Telegram 服务器、消息已经送达，但返回响应的
+ * 路上网络抖动/超时，UrlFetchApp 会抛异常，这里会把它当发送失败处理。
+ * 调用方（ReminderEngine._sendReminder）看到 ok:false 不会更新提醒状态，
+ * 下次触发器会重新判断要不要提醒，如果确实已经送达，就会变成重复提醒。
+ * 已核实：① UrlFetchApp 没有任何手段区分"请求根本没到"和"到了但响应
+ * 丢了"这两种情况；② Telegram Bot API 的 sendMessage 不支持幂等键/
+ * 去重 token（官方 Bot API 的 issue tracker 上这是一个至今未实现的
+ * open feature request）。两个平台都不提供解决这个问题所需的手段，
+ * 不是本项目代码层面能修的问题。按照审计建议本身给的方向，在业务层面
+ * 接受这是"至少送达一次"语义下的偶发代价，见
+ * 00_Project_State.gs「已知问题」。catch 分支加了 ambiguousDelivery
+ * 标记，方便以后翻日志时把这种"响应丢失导致的疑似重复"和其他真实发送
+ * 失败区分开，见下方 sendMessage 的注释。
  */
 
 var Output = (function () {
@@ -59,8 +76,16 @@ var Output = (function () {
       }
       return body;
     } catch (e) {
-      Logger.log('[Output] ❌ sendMessage 出错: ' + e.message);
-      return { ok: false, error: e.message };
+      // 🐛 第四轮审计 MEDIUM RISK 2 关联：这里既可能是"请求根本没打到
+      // Telegram"（DNS失败/连接被拒绝，消息确定没发出去，重试安全），
+      // 也可能是"Telegram 已经收到并处理、消息已经送达，只是返回响应
+      // 的路上超时/网络抖动导致 UrlFetchApp 抛错"（这种情况下重试会
+      // 造成重复发送）。没有办法从这里区分两者（见本文件头说明），
+      // 加 ambiguousDelivery 标记只是方便以后翻日志排查，不代表问题
+      // 被解决了。
+      Logger.log('[Output] ❌ sendMessage 出错（送达状态不确定，消息可能' +
+        '已经实际送达但响应未能返回）: ' + e.message);
+      return { ok: false, error: e.message, ambiguousDelivery: true };
     }
   }
 
