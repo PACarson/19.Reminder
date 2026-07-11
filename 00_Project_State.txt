@@ -3,7 +3,13 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-10 — 修复第四轮外部审计发现的 HIGH RISK 1/2/3、
+ * LAST_UPDATED: 2026-07-11 — 拿到 Productivity OS 代码，解决第三轮
+ * 外部审计遗留的 HIGH RISK 2（QueryEngine 读整张 Tasks 表的性能问题），
+ * getPendingTasks() 改为从 ActiveTasks 取候选+对 Tasks 定点查两个字段；
+ * 记录两个调查过程中发现的、跟 Productivity OS 有关但不是本项目能修的
+ * 观察（last_reminder_at 不在官方 schema 清单里、TaskStatistics.
+ * reminder_count_total 实际不会被本项目触发更新）。
+ * 2026-07-10 — 修复第四轮外部审计发现的 HIGH RISK 1/2/3、
  * MEDIUM RISK 1 共4项；核实 MEDIUM RISK 2（Telegram 送达状态不确定导致
  * 的偶发重复发送）和 LOW RISK 1（Constitution 抽象层建议）属实但不适合
  * /不需要代码修复，理由见「已知问题」和 00_Project_Constitution.gs P1。
@@ -190,6 +196,43 @@
  *   8组回归测试（提前量判断/last_reminder_at落盘/发送失败不改状态/
  *   单任务异常隔离/OVERDUE间隔/简单锁重试链路/EventBus单条publish不受
  *   影响/_persistBatch失败重试）全部通过，确认无回归。
+ *
+ * - 2026-07-11：拿到 Productivity OS 代码，解决第三轮外部审计遗留的
+ *   HIGH RISK 2（QueryEngine._readAllRows_ 读整张 Tasks 表历史行的性能
+ *   问题），完整依据见 00_ADR_002_ReminderEngine_Audit_Fixes.gs「第三轮
+ *   HIGH RISK 2 后续解决」：
+ *   · 确认 ActiveTasks 由 Productivity OS 的 10_ProjectionEngine.gs 在
+ *     每次 TASK_CREATED/UPDATED/COMPLETED/CANCELLED 时同步维护（不是
+ *     定时批处理），永远只含当前非终态任务，体量只随"当前未完成任务数"
+ *     增长，不随历史任务数增长。
+ *   · 确认 ActiveTasks 不含 reminder_count 的实时数据（Productivity OS
+ *     自己的投影逻辑明确跳过这一列），且
+ *     26_AnalyticsEngine.gs 的"平均提醒次数"统计依赖 Tasks 全量任务
+ *     （含已完成）的 reminder_count 历史值——这两点决定了 reminder_count/
+ *     last_reminder_at 不能整体搬去 ActiveTasks，权威数据必须继续留在
+ *     Tasks。
+ *   · 21_SheetUtils.gs 新增 batchReadFieldsByKey_（只读 key 列定位行号、
+ *     对给定的一批 key 定点读取指定字段，是 batchUpdateFieldsByKey_ 的
+ *     读版本）；22_QueryEngine.gs 的 getPendingTasks() 改成两步：①从
+ *     ActiveTasks 取候选任务列表（便宜，体量小）；②对候选列表的
+ *     task_id，用 batchReadFieldsByKey_ 从 Tasks 定点取 reminder_count/
+ *     last_reminder_at（不读 Tasks 其余列，也不碰候选列表之外的历史行）。
+ *   · getCompletedTasks()/getTaskById() 没有跟着改——本项目目前没有
+ *     调用方，继续读全量 Tasks，理由见 22_QueryEngine.gs 文件头。
+ *   · 00_Project_Constitution.gs P3 正式修订（不是补充）："只读 Tasks...
+ *     不碰 ActiveTasks/ArchiveTasks"这句原文已经不准确，改成"读
+ *     ActiveTasks 取候选 + 对 Tasks 定点查两个字段"，写边界不变。
+ *   · 过程中发现两个跟本次修复相关、但不在本次修复范围内的情况，记在
+ *     下面「已知问题」：Productivity OS 的 15_Setup.gs schema 定义里
+ *     Tasks/ActiveTasks 都没有 last_reminder_at 这一列，但
+ *     11_ProjectionRebuilder.gs 却在处理这一列；TaskStatistics.
+ *     reminder_count_total 这个统计字段实际上不会被本项目发送的
+ *     REMINDER_SENT 事件更新到。
+ *   3组新场景测试（大表下验证不整表读、ActiveTasks/Tasks 数据不一致时
+ *   优雅降级、端到端流程验证 reminder_count 正确写回 Tasks 而不是
+ *   ActiveTasks）+ 1组新回归测试（ActiveTasks 不存在时优雅降级不崩溃），
+ *   加上前四轮遗留的全部测试（第四轮换用 Productivity OS 真实 schema
+ *   重新构造夹具后）一并重跑，全部通过，确认无回归。
  */
 
 // ============================================================
@@ -247,6 +290,13 @@
  *     的代码才能确认，这次没有拿到。如果 Carson 能提供 Productivity OS
  *     关于 ActiveTasks 的代码，我可以评估切换的可行性。
  *
+ *     ✅ 2026-07-11 已解决：拿到 Productivity OS 代码，确认 ActiveTasks
+ *     由 10_ProjectionEngine.gs 实时同步维护、真的只含非终态任务，已
+ *     切换 getPendingTasks() 改用 ActiveTasks 取候选+对 Tasks 定点查
+ *     reminder_count/last_reminder_at，见「已完成」和
+ *     00_ADR_002_ReminderEngine_Audit_Fixes.txt「第三轮 HIGH RISK 2
+ *     后续解决」。这一条从"已知问题"移除。
+ *
  * - 【第四轮审计核实属实、决定不修/无法从代码层面消除，理由见
  *   ADR-002「第四轮外部审计」】
  *   · MEDIUM RISK 2：_sendReminder 发消息时，如果 Telegram 已经收到并
@@ -260,6 +310,35 @@
  *     方向在业务层面接受这是"至少送达一次"语义下的偶发代价，
  *     40_Output.gs 的 catch 分支加了 ambiguousDelivery 标记，方便以后
  *     翻日志时把这种情况跟其他真实发送失败区分开，仅此而已。
+ *
+ * - 【2026-07-11 拿到 Productivity OS 代码后发现，不是 Reminder OS 自身
+ *   的 bug，记录下来是因为跟本项目的正确性间接相关，值得 Carson 知道】
+ *   · last_reminder_at 这一列不在 Productivity OS 的 15_Setup.gs 的
+ *     schema 定义里（setupSheets()/repairSheetHeaders() 都没提到这一列，
+ *     Tasks/ActiveTasks/ArchiveTasks 三张表都没有），但
+ *     11_ProjectionRebuilder.gs 的 deriveFromEvent 处理 REMINDER_SENT
+ *     事件时，确实会计算并预期写入这一列（stateMap[...].last_reminder_at
+ *     = p.sent_at || event.timestamp）。这说明 Productivity OS 那边的
+ *     "官方 schema 清单"和"实际被依赖的字段"之间存在一处没有互相同步的
+ *     缺口——本项目从第一天起就假设 Tasks 表实际存在 last_reminder_at
+ *     这一列（历次审计和测试都是这么假设的，也一直工作正常，没有出现过
+ *     "写不进去"的迹象），但本项目自己的 11_Setup.gs 从未创建过这一列，
+ *     Productivity OS 的 setupSheets() 官方清单里也没有——大概率是当初
+ *     手动加的，具体是谁、什么时候加的，两边的代码历史都查不出来。这
+ *     不是本项目能确认或修复的问题（本项目没有、也不应该有修改 Tasks
+ *     表结构的权限），只是如实记录这处发现，供 Carson 判断要不要去
+ *     Productivity OS 那边把 schema 清单补齐。
+ *   · TaskStatistics.reminder_count_total 这个统计字段，设计意图是靠
+ *     REMINDER_SENT 事件增量维护（10_ProjectionEngine.gs 明确有对应的
+ *     dispatch 分支），但 Reminder OS 是完全独立的 GAS 项目，自己发布
+ *     REMINDER_SENT 事件到共享 Events 表这个动作，不会触发 Productivity
+ *     OS 自己的 EventBus.publish→ProjectionEngine.dispatch 链路（那条链路
+ *     只在 Productivity OS 自己的执行上下文里同步触发，不会跨项目
+ *     感知另一个项目写入共享 Sheet 的动作）。也就是说，除非
+ *     Productivity OS 自己内部还有别的路径会调用这个 dispatch 分支，
+ *     否则这个统计字段实际上不会被真实的提醒发送行为更新，可能从设计
+ *     出来就没真正生效过。这也不是本项目能确认或修复的问题（不涉及
+ *     Reminder OS 拥有的任何数据），只是如实记录。
  */
 
 // ============================================================

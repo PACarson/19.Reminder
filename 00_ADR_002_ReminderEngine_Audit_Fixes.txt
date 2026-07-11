@@ -3,10 +3,11 @@
  * Reminder OS — 架构决策记录 #002
  *
  * STATUS: Accepted
- * DATE: 2026-07-06（第一轮），后续三轮追加审计的核实+修复过程直接续在
- * 同一份 ADR 里（第二轮/第三轮同为 2026-07-06，第四轮 2026-07-10）——
- * 都是同一份审计对象（ReminderEngine 及其直接依赖）的持续复审，不是
- * 独立决策，没有必要拆成 ADR-002a/002b/002c/002d 各自维护。
+ * DATE: 2026-07-06（第一轮），后续追加审计/后续解决的核实+修复过程
+ * 直接续在同一份 ADR 里（第二轮/第三轮同为 2026-07-06，第四轮
+ * 2026-07-10，第三轮 HIGH RISK 2 后续解决 2026-07-11）——都是同一份
+ * 审计对象（ReminderEngine 及其直接依赖）的持续复审/延续解决，不是
+ * 独立决策，没有必要拆成 ADR-002a/002b/002c/002d/002e 各自维护。
  */
 
 /**
@@ -650,4 +651,161 @@
  *   只做诊断增强，业务层面接受为"至少送达一次"语义下的偶发代价；
  *   LOW RISK 1（Constitution 抽象层建议）核实后确认不是新问题，是已有
  *   决定的重新核实，结论不变，理由见 P1 的核实记录和 Progression Rule。
+ *
+ * === 第三轮 HIGH RISK 2 后续解决（2026-07-11） ===
+ *
+ * 背景：第三轮外部审计（2026-07-06）指出 QueryEngine._readAllRows_ 每次
+ * 被 getPendingTasks() 调用都会读整张 Tasks 表（含全部历史 DONE/
+ * CANCELLED 任务），核实属实，但当时评估"正确的修法（归档）需要移动/
+ * 删除 Tasks 表的行，会越界碰 Productivity OS 拥有的数据"，同时提到
+ * "ActiveTasks 表如果真的由 Productivity OS 维护成只放未完成任务，可能
+ * 是更好的方向，但需要看 Productivity OS 的代码才能确认"——当时没有
+ * 这份代码，记成已知问题搁置。Carson 这次提供了 Productivity OS 的完整
+ * 代码，可以正式评估并解决。
+ *
+ * 核实 ActiveTasks 的真实机制（不是从命名或注释推测，是逐个函数看过
+ * Productivity OS 的 10_ProjectionEngine.gs 后确认的）：
+ *   1. TASK_CREATED 时，projectTaskCreated_ 在同一次调用里先 upsert
+ *      Tasks，再 upsert ActiveTasks（后者包了 try/catch，失败不影响
+ *      前者）——两张表同步更新，不是定时批处理、也不是最终一致。
+ *   2. TASK_COMPLETED/TASK_CANCELLED 时，projectTaskCompleted_ 等函数
+ *      更新 Tasks 的 status 之后，会把 ActiveTasks 里对应的行整行删除
+ *      （deleteRowByKey_）。TASK_UPDATED 时，如果任务更新前的状态已经是
+ *      终态，不会重新把它塞回 ActiveTasks。
+ *   3. 结论：ActiveTasks 任何时刻都精确等于"当前非终态任务集合"，体量
+ *      只随"现在有多少未完成任务"变化，不随历史任务数增长——这正是
+ *      getPendingTasks() 需要的数据形状。
+ *   4. 13_ActiveTasksEngine.gs 的 runDailyArchive（每日归档）操作的是
+ *      Tasks→ArchiveTasks 这条线，不是 ActiveTasks——文件头明确写
+ *      "归档后 Tasks 里对应行加 archived=true 标记，不物理删除...物理
+ *      删除会让 rebuildAllProjections() 失去重建依据"。也就是说 Tasks
+ *      表本身永远不会变小，这是 Productivity OS 自己的既有决定，不是
+ *      本项目能改、也不需要改的地方——本项目的修复目标是"不因为 Tasks
+ *      变大而变慢"，不是"让 Tasks 变小"。
+ *
+ * 核实 reminder_count/last_reminder_at 能不能整体搬去 ActiveTasks（评估
+ * "干脆只读写 ActiveTasks，完全不碰 Tasks"这个更彻底方案时发现的两个
+ * 阻塞点，决定了不能这样做）：
+ *   1. 10_ProjectionEngine.gs 里，凡是涉及 ActiveTasks 的投影函数都明确
+ *      跳过 reminder_count 这一列（原文注释"ActiveTasks 不需要
+ *      reminder_count（工作台不展示这列），跳过"）——也就是说即使
+ *      ActiveTasks 的表结构上有这一列，Productivity OS 自己也从不维护
+ *      它，本项目如果读它会读到过时/无意义的值。
+ *   2. 26_AnalyticsEngine.gs 的 computeStatistics 接收"已终结+未终结的
+ *      全量 task"，用其中的 reminder_count 算 avg_reminder_count，被
+ *      25_DashboardEngine.gs 的仪表盘展示——这个统计必须覆盖已完成的
+ *      任务才有意义（"平均要提醒几次任务才会做完"），如果本项目改成
+ *      只把 reminder_count 写在 ActiveTasks，任务一完成对应行就被
+ *      Productivity OS 的投影逻辑删除，这个字段的值会跟着消失，
+ *      Productivity OS 这个既有统计功能会失真（永远显示0）。这不是
+ *      本项目愿不愿意承担的问题，是会实际破坏 Productivity OS 一个
+ *      已经在用的功能，不能做。
+ *   结论：reminder_count/last_reminder_at 的权威数据必须继续留在
+ *   Tasks，读边界可以扩大到 ActiveTasks，写边界不能跟着挪。
+ *
+ * 修复：
+ *   1. 21_SheetUtils.gs 新增 batchReadFieldsByKey_——只读 keyHeader 这
+ *      一列定位行号，对给定的一批 key 只定点读取指定的字段，不读整表
+ *      其余列。是 batchUpdateFieldsByKey_（第四轮新增，写版本）的读
+ *      版本，同一个思路。
+ *   2. 22_QueryEngine.gs 的 getPendingTasks() 改成两步：① 用
+ *      _readAllRows_(ActiveTasks) 取候选任务（这一步仍然是"整表读"，
+ *      但 ActiveTasks 体量小、只随当前活跃任务数增长，读整张小表没有
+ *      问题——O(N) 问题的本质是"N 会不会跟着历史无限增长"，不是"能不能
+ *      整表读"本身）；② 用 batchReadFieldsByKey_ 对候选任务的 task_id
+ *      去 Tasks 定点取 reminder_count/last_reminder_at（只读1列定位+
+ *      对候选任务定点取2个字段，成本正比于候选任务数和 Tasks 总行数的
+ *      1列宽度，不再正比于 Tasks 总行数×总列数）。
+ *   3. status 过滤条件保持"严格等于 PENDING"不变——核实了 Productivity
+ *      OS 的 20_TaskEngine.gs，任务创建时状态永远是 'PENDING'，代码里
+ *      没有任何路径会产生 'IN_PROGRESS'/'WAITING'（Constitution 里
+ *      "ActiveTasks 只存 PENDING/IN_PROGRESS/WAITING"的表述目前是
+ *      预留的、还没有被用到的可能性）。如果照 ActiveTasks 的字面定义
+ *      把候选条件放宽成"非终态"，会在未来 Productivity OS 真的用上
+ *      IN_PROGRESS/WAITING 那天，让 Reminder OS 开始提醒以前从不提醒
+ *      的任务——这是一个产品行为决定，不应该作为性能修复的副作用悄悄
+ *      发生，所以没有放宽，行为跟改动前完全一致，只是数据来源变了。
+ *   4. getCompletedTasks()/getTaskById() 没有跟着改——本项目目前没有
+ *      任何调用方，不在 checkReminders 每小时都会跑的路径上。给不会被
+ *      调用的代码做同样的优化没有实际收益，只会增加"两个函数为什么
+ *      处理方式不一样"的解释负担，等真的有功能会调用它们时再照这次的
+ *      思路处理。
+ *   5. 00_Project_Constitution.gs P3 正式修订（不是追加说明）：原文
+ *      "只读 Tasks 表...不碰 ActiveTasks/ArchiveTasks"这句话本身不再
+ *      准确，必须改字——这跟本文件之前几轮"边界没变，只是实现细节变了"
+ *      的情况不同，这次是边界本身变了，按 Constitution 自己的原则
+ *      （宪法应该反映真实边界，不是历史记录），需要修订原文，不是加
+ *      批注。
+ *
+ * ⚠️ 没有做、且明确评估过为什么不做：
+ *   - 没有让 Reminder OS 改写 ActiveTasks（哪怕只是 reminder_count 这
+ *     一列）——会破坏 26_AnalyticsEngine.gs 的统计功能，见上面的核实
+ *     过程。
+ *   - 没有去改 Productivity OS 的任何代码（比如让它的 Projection 也
+ *     同步 reminder_count 到 ActiveTasks，或者把 last_reminder_at
+ *     补进它的官方 schema 清单）——这些改动如果要做，应该由 Carson
+ *     决定、在 Productivity OS 自己的治理流程里做，不是 Reminder OS
+ *     这边能单方面决定的事，本项目仍然保持"只读它、不要求它改任何东西"
+ *     这个最小侵入的关系。
+ *   - 没有实现"整表归档/物理搬迁 Tasks 里的旧数据"——这从一开始就不是
+ *     本项目能做的事（Constitution P3 的写边界从没变过），而且
+ *     Productivity OS 自己已经有 ArchiveTasks 这套机制、也已经明确
+ *     决定不物理删除 Tasks 里的行，本项目没有理由、也没有权限去动这
+ *     部分。
+ *
+ * 调查过程中发现两个跟本次修复相关、但不是 Reminder OS 的 bug、本项目
+ * 也没有能力独立核实或修复的情况，只做记录，见
+ * 00_Project_State.gs「已知问题」：
+ *   - last_reminder_at 不在 Productivity OS 的 15_Setup.gs 官方 schema
+ *     清单里，但 11_ProjectionRebuilder.gs 的 deriveFromEvent 确实在
+ *     处理这一列——两边不完全同步。本项目从最早版本起就假设这一列
+ *     存在且可写，一直正常工作，大概率是当初手动加到 Sheet 里的，但
+ *     无法从代码历史里确认。
+ *   - TaskStatistics.reminder_count_total 依赖 REMINDER_SENT 事件触发
+ *     Productivity OS 自己的 ProjectionEngine.dispatch，但 Reminder OS
+ *     是独立 GAS 项目，发布事件这个动作不会跨项目触发 Productivity OS
+ *     的 dispatch 链路——这个统计字段可能从设计出来就没有被真实的提醒
+ *     行为更新过。
+ *
+ * === 第三轮 HIGH RISK 2 后续解决 —— 验证方式 ===
+ *
+ * 沿用同一套 mock GAS 环境，新增了 ActiveTasks 表的模拟，并且把测试
+ * 夹具换成跟 Productivity OS 的 15_Setup.gs 逐字段对齐的真实表头（不再
+ * 用之前几轮测试里简化过的8列版本）——这个换血过程本身也倒查出前四轮
+ * 测试用的简化 schema 跟真实情况有出入，借这个机会把所有涉及
+ * checkReminders() 端到端流程的测试夹具都统一成真实 schema，避免"测试
+ * 通过但跟真实表结构对不上"这种虚假的安全感。
+ *
+ * 新写3组场景测试：① 用1000条历史任务+3条当前任务构造"体量悬殊"的
+ * Tasks/ActiveTasks，验证只返回3条候选、reminder_count/last_reminder_at
+ * 正确从 Tasks 补全、且没有发生"多列×多行"的整表读、对 Tasks 的定点
+ * 字段读取次数只等于"候选数×字段数"不随历史任务数增长；② ActiveTasks
+ * 和 Tasks 数据出现不一致（Tasks 里根本没有 ActiveTasks 提到的
+ * task_id）时优雅降级为"无提醒历史"，不抛异常，且记录警告日志；③ 端到
+ * 端跑一次完整的 checkReminders()，确认间隔判断（用从 Tasks 定点取到的
+ * last_reminder_at）仍然正确、最终 reminder_count 写回 Tasks 而不是
+ * ActiveTasks、ActiveTasks 全程没有被写入任何数据。
+ * 新写1组回归测试：ActiveTasks 表不存在时（比如 Productivity OS 还没
+ * 跑过 setupSheets()），不抛异常，优雅降级为空候选列表。
+ * 前四轮遗留的全部测试（换用真实 schema 重新构造夹具后）一并重跑，
+ * 全部通过，确认这次改动没有影响前四轮已经修好的任何行为。
+ *
+ * === 第三轮 HIGH RISK 2 后续解决 —— 后果 ===
+ *
+ * - 2_Runtime/22_QueryEngine.gs：新增 ACTIVE_TASKS_SHEET 常量；
+ *   getPendingTasks() 改为"ActiveTasks 取候选 + Tasks 定点补两个字段"
+ *   两步流程；getCompletedTasks()/getTaskById() 不变。
+ * - 2_Runtime/21_SheetUtils.gs：新增 batchReadFieldsByKey_，其余不变。
+ * - 0_Governance/00_Project_Constitution.gs：P3 正式修订读边界描述
+ *   （"只读 Tasks...不碰 ActiveTasks"→"读 ActiveTasks 取候选+对 Tasks
+ *   定点查两个字段"），P1 同步更新表述，写边界（只写 Tasks 的两个字段）
+ *   不变。
+ * - 本项目对 Productivity OS 数据的读取范围从"Tasks 一张表"扩大为
+ *   "Tasks + ActiveTasks 两张表"，仍然是纯只读关系，没有新增任何写入
+ *   目标，没有要求 Productivity OS 修改任何代码。
+ * - 发现两处跟 Productivity OS 自身相关、本项目无法独立确认或修复的
+ *   情况（last_reminder_at 官方 schema 缺失、TaskStatistics.
+ *   reminder_count_total 可能从未被真实触发过），记录在
+ *   00_Project_State.gs「已知问题」，留给 Carson 判断是否需要在
+ *   Productivity OS 那边跟进。
  */

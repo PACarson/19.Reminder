@@ -411,6 +411,78 @@ var SheetUtils = (function () {
     return { updated: updated, notFound: notFound };
   }
 
+  /**
+   * 🐛 2026-07-11 新增（解决第三轮外部审计遗留的 HIGH RISK 2 ——
+   * QueryEngine._readAllRows_ 读整张 Tasks 表——现在拿到 Productivity OS
+   * 代码后确认可以怎么修，完整决策依据见
+   * 00_ADR_002_ReminderEngine_Audit_Fixes.txt「第三轮 HIGH RISK 2 后续
+   * 解决」）。
+   *
+   * 批量【稀疏字段读取】：只读 keyHeader 这一列定位行号，再对给定的一批
+   * key，只读 fields 里指定的那几个字段，不读整表其余列——跟
+   * batchUpdateFieldsByKey_ 是同一个思路的读版本（那个是写）。
+   *
+   * 设计用途：22_QueryEngine.gs 现在从 ActiveTasks（小表，只有当前未完成
+   * 任务）取候选任务列表，但 reminder_count/last_reminder_at 这两个字段
+   * 的权威数据仍然在 Tasks（原因见 22_QueryEngine.gs 文件头）——用这个
+   * 函数只为候选列表里的少数几个 task_id 去 Tasks 表定点取这两个字段，
+   * 不需要读 Tasks 表的其余16列，也不需要读 Tasks 表里跟候选列表无关的
+   * 那些历史行的任何数据。
+   *
+   * @param {string} sheetName
+   * @param {string} keyHeader   用来定位行的列名，比如 'task_id'
+   * @param {Array} keys         要查的 key 值列表
+   * @param {string[]} fields    每个命中的 key，要读取的字段名列表
+   * @returns {object}  { [keyValue的字符串形式]: { field1: val1, field2: val2, ... } }
+   *                     没找到的 key 不会出现在返回对象里（不是空对象，是完全不存在这个属性）。
+   */
+  function batchReadFieldsByKey_(sheetName, keyHeader, keys, fields) {
+    if (!keys || keys.length === 0 || !fields || fields.length === 0) return {};
+
+    var sheet = getSheet_(sheetName);
+    var headerMap = getHeaderMap_(sheet);
+
+    if (!(keyHeader in headerMap)) {
+      throw new Error('找不到列: ' + keyHeader + '，请确认 ' + sheetName + ' 表头里有这一列');
+    }
+
+    var keyColIndex = headerMap[keyHeader];
+    var lastRow = sheet.getLastRow();
+
+    var wantedKeys = {};
+    keys.forEach(function (k) {
+      if (k !== undefined && k !== null && k !== '') wantedKeys[String(k)] = true;
+    });
+
+    // 只读 key 这一列（不是整表），只记录我们关心的那些 key 对应的行号——
+    // 这一步的读取量仍然正比于 sheetName 的总行数（1列宽），但比
+    // batchUpdateFieldsByKey_ 更进一步的优化（比如维护一份持久化索引）
+    // 目前没有必要，见 22_QueryEngine.gs 文件头关于这一点的说明。
+    var rowNumByKey = {};
+    if (lastRow >= 2) {
+      var keyValues = sheet.getRange(2, keyColIndex + 1, lastRow - 1, 1).getValues();
+      for (var i = 0; i < keyValues.length; i++) {
+        var k = keyValues[i][0];
+        if (k === '' || k === null || k === undefined) continue;
+        var kStr = String(k);
+        if (wantedKeys[kStr]) rowNumByKey[kStr] = i + 2;
+      }
+    }
+
+    var result = {};
+    for (var keyStr in rowNumByKey) {
+      var rowNum = rowNumByKey[keyStr];
+      var obj = {};
+      fields.forEach(function (f) {
+        if (headerMap.hasOwnProperty(f)) {
+          obj[f] = sheet.getRange(rowNum, headerMap[f] + 1).getValue();
+        }
+      });
+      result[keyStr] = obj;
+    }
+    return result;
+  }
+
   // ============ 共用：过期判断 ============
   // 原本在92_ReminderEngine.gs里，21_InventoryModule.gs跨文件直接调用它的
   // 私有函数（_parseDueDate_），93_MemoryEngine.gs又自己重复实现了一份一样
@@ -502,6 +574,7 @@ var SheetUtils = (function () {
     deleteRowByKey_: deleteRowByKey_,
     batchUpsertRowsByKey_: batchUpsertRowsByKey_,
     batchUpdateFieldsByKey_: batchUpdateFieldsByKey_,
+    batchReadFieldsByKey_: batchReadFieldsByKey_,
     isOverdue_: isOverdue_,
     parseDueDate_: parseDueDate_,
     round1_: round1_,

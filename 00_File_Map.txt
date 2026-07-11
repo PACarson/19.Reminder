@@ -2,7 +2,12 @@
  * 00_File_Map.gs
  * Reminder OS v1.0 — 文件地图
  *
- * LAST_UPDATED: 2026-07-10 — 修复第四轮外部审计发现的 HIGH RISK 1/2/3、
+ * LAST_UPDATED: 2026-07-11 — 拿到 Productivity OS 代码，解决第三轮外部
+ * 审计遗留的 HIGH RISK 2：22_QueryEngine.gs 的 getPendingTasks() 改用
+ * ActiveTasks 取候选任务+对 Tasks 定点查两个字段；21_SheetUtils.gs
+ * 新增 batchReadFieldsByKey_；00_Project_Constitution.gs P3 正式修订
+ * 读边界。
+ * 2026-07-10 — 修复第四轮外部审计发现的 HIGH RISK 1/2/3、
  * MEDIUM RISK 1 共4项（EventBus 批量发布 Events、重试 trigger 清理、
  * 时间预算重新推导、Tasks 表定点字段更新）；核实 MEDIUM RISK 2/
  * LOW RISK 1 属实但不适合/不需要代码修复。完整决策依据见 00_ADR_002
@@ -115,15 +120,33 @@
  *   时复用的 batchUpsertRowsByKey_（那个函数每次调用都整表读写，成本
  *   正比于表总行数）。batchUpsertRowsByKey_ 本身不变，继续保留给真正
  *   需要"找不到就插入"语义的场景用。对外暴露函数数量从11个增加到12个。
+ *   【2026-07-11，解决第三轮遗留的 HIGH RISK 2】新增
+ *   batchReadFieldsByKey_：batchUpdateFieldsByKey_ 的读版本，只读 key
+ *   列定位行号、对给定的一批 key 定点读取指定字段。给 22_QueryEngine.gs
+ *   用，对候选任务列表从 Tasks 定点取 reminder_count/last_reminder_at。
+ *   对外暴露函数数量从12个增加到13个。
  * 22_QueryEngine.gs 〔原 12_QueryEngine.gs〕— Query。
- *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。逻辑
- *   逐字未改，【2026-07-06】调用 SheetUtils 的方式同步改成命名空间形式
+ *   精简版，只有 getPendingTasks/getCompletedTasks/getTaskById。
+ *   【2026-07-06】调用 SheetUtils 的方式同步改成命名空间形式
  *   （SheetUtils.getSheet_/SheetUtils.getHeaderMap_）。
  *   ⚠️ 第三轮审计 HIGH RISK 2：_readAllRows_ 每次都读 Tasks 表全部
- *   历史行（含早已 DONE/CANCELLED 的），表越大越慢——核实属实，但正确
- *   的修法（归档）需要移动/删除 Tasks 表的行，会越界碰 Productivity OS
- *   拥有的数据（Constitution P3），没有在这里修，完整理由见
- *   00_Project_State.gs「已知问题」。
+ *   历史行（含早已 DONE/CANCELLED 的），表越大越慢——核实属实，当时
+ *   因为看不到 Productivity OS 代码、无法评估有没有更好的数据源，
+ *   没有在这里修，理由见 00_Project_State.gs「已知问题」（历史记录）。
+ *   ✅【2026-07-11 已解决】拿到 Productivity OS 代码后，getPendingTasks()
+ *   改为两步：①从 ActiveTasks（Productivity OS 实时维护、只含非终态
+ *   任务的小表）取候选；②对候选列表用新增的
+ *   SheetUtils.batchReadFieldsByKey_ 从 Tasks 定点取 reminder_count/
+ *   last_reminder_at（权威数据仍在 Tasks，原因见文件头）。新增
+ *   ACTIVE_TASKS_SHEET 常量（='ActiveTasks'，只读，不写）。
+ *   getCompletedTasks()/getTaskById() 本项目目前无调用方，未跟着改，
+ *   继续读全量 Tasks。完整决策依据见
+ *   00_ADR_002_ReminderEngine_Audit_Fixes.txt「第三轮 HIGH RISK 2
+ *   后续解决」。
+ *   ⚠️ 本项目对 Productivity OS 数据的依赖范围从"只读 Tasks 表"扩大为
+ *   "读 Tasks + ActiveTasks 两张表"，这是一处需要留意的跨项目耦合面
+ *   扩大——完整边界定义见 00_Project_Constitution.gs P3
+ *   「2026-07-11 更新」。
  * 25_ReminderEngine.gs 〔原 92_ReminderEngine.gs〕— Decision
  *   （_shouldRemind/_isOverdue/_hoursUntilDue）+ Execution
  *   （checkReminders/_buildReminder/_sendReminder/_recordReminderSent，
@@ -218,7 +241,13 @@
  *   见 ADR-002 第四轮 MEDIUM RISK 1 / HIGH RISK 1）
  *
  * 2_Runtime/22_QueryEngine.gs
- *   → SheetUtils.getSheet_ / SheetUtils.getHeaderMap_ [2_Runtime/21_SheetUtils.gs]
+ *   → SheetUtils.getSheet_ / SheetUtils.getHeaderMap_ /
+ *     SheetUtils.batchReadFieldsByKey_                  [2_Runtime/21_SheetUtils.gs]
+ *   → 读 ActiveTasks 表（Productivity OS 拥有并维护，本项目只读）
+ *   （2026-07-11 起：getPendingTasks() 候选列表来自 ActiveTasks，
+ *   reminder_count/last_reminder_at 从 Tasks 定点补全，见 ADR-002
+ *   「第三轮 HIGH RISK 2 后续解决」。getCompletedTasks()/getTaskById()
+ *   仍然只读 Tasks，未跟着改，见 22_QueryEngine.gs 文件头）
  *
  * 2_Runtime/20_EventBus.gs
  *   → SecureConfig.getKey('SPREADSHEET_ID')           [1_Foundation/10_SecureConfig.gs]

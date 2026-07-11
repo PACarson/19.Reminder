@@ -5,7 +5,10 @@
  * 平台级原则的权威定义在 Personal AI Core 项目的
  * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
  *
- * LAST_UPDATED: 2026-07-10 — 修订 P3（写入机制细化为定点字段更新+Events
+ * LAST_UPDATED: 2026-07-11 — 修订 P3（读边界从"只读 Tasks"扩大为"读
+ * ActiveTasks 取候选+对 Tasks 定点查 reminder_count/last_reminder_at"，
+ * 解决第三轮外部审计遗留的 HIGH RISK 2）；同步修订 P1 的表述。
+ * 2026-07-10 — 修订 P3（写入机制细化为定点字段更新+Events
  * 批量发布，第四轮外部审计 HIGH RISK 1/MEDIUM RISK 1 关联）；P1 补充
  * 第四轮审计核实记录（LOW RISK 1 关联，结论：现状不变）。
  * 2026-07-06 — 新增 P6（Telegram callback 跨项目契约，外部
@@ -16,10 +19,11 @@
 /**
  * P1. 定位
  *     全平台共享的时间与通知服务。不是 Productivity OS 专属——现在读
- *     Tasks 表判断该不该提醒；未来 Property/Finance/Vehicle OS 只要往
- *     共享 Spreadsheet 写自己的表，这个项目加一段"也查那张表"的逻辑，
- *     就能复用同一套提醒/通知机制，不需要每个 Domain OS 各自重新做一套
- *     （见 Core 项目 Constitution D2/D5）。
+ *     Tasks/ActiveTasks 两张表判断该不该提醒（见 P3 2026-07-11 更新）；
+ *     未来 Property/Finance/Vehicle OS 只要往共享 Spreadsheet 写自己的表，
+ *     这个项目加一段"也查那张表"的逻辑，就能复用同一套提醒/通知机制，
+ *     不需要每个 Domain OS 各自重新做一套（见 Core 项目 Constitution
+ *     D2/D5）。
  *
  *     ✅ 2026-07-10 核实（第四轮外部审计 LOW RISK 1，结论：现状不变）：
  *     审计建议为对接多个 Domain OS 引入一层抽象模型/字段映射，核实后
@@ -39,10 +43,9 @@
  *     是"读写同一张共享 Google Sheet"。
  *
  * P3. 数据边界
- *     只读 Tasks 表（属于 Productivity OS 的地盘），只写 Tasks 表的
- *     reminder_count/last_reminder_at 两个字段，不碰其他字段，不碰
- *     ActiveTasks/ArchiveTasks；另外追加自己的 REMINDER_SENT 事件到共享
- *     Events 表。
+ *     只写 Tasks 表的 reminder_count/last_reminder_at 两个字段，不碰
+ *     其他字段，不碰 ActiveTasks/ArchiveTasks 的任何写入；另外追加自己的
+ *     REMINDER_SENT 事件到共享 Events 表。
  *
  *     ✅ 2026-07-06 更新（外部审计 HIGH RISK 1 关联）：写 Tasks 表这两个
  *     字段的机制从"每个任务各自直接 upsertRowByKey_"改成"checkReminders()
@@ -52,7 +55,7 @@
  *
  *     ✅ 2026-07-10 更新（第四轮外部审计 HIGH RISK 1/MEDIUM RISK 1 关联）：
  *     两处进一步细化，边界本身（只写这两个字段、只追加 Events、不碰
- *     ActiveTasks/ArchiveTasks）没有变：
+ *     ActiveTasks/ArchiveTasks 的写入）没有变：
  *       - 写 Tasks 表这两个字段，改成 SheetUtils.batchUpdateFieldsByKey_
  *         按批次做定点单元格更新（不再整表读写），仍然只碰
  *         reminder_count/last_reminder_at；
@@ -60,6 +63,32 @@
  *         按批次一次性写入多行，不再是循环内逐条 appendRow。
  *     完整决策依据见 2_Runtime/25_ReminderEngine.gs 文件头和
  *     00_ADR_002_ReminderEngine_Audit_Fixes.txt「第四轮」。
+ *
+ *     🆕 2026-07-11 更新（读边界扩大，解决第三轮遗留的 HIGH RISK 2）：
+ *     本条原文是"只读 Tasks 表...不碰 ActiveTasks/ArchiveTasks"——这句话
+ *     现在不准确了，需要正式修订，不是补充说明：
+ *
+ *     读边界从"只读 Tasks"扩大为"读 ActiveTasks（候选任务列表）+ 对
+ *     Tasks 做定点字段查询（reminder_count/last_reminder_at）"。原因：
+ *     2_Runtime/22_QueryEngine.gs 的 getPendingTasks() 之前整张 Tasks
+ *     表（含全部历史 DONE/CANCELLED 任务）都要读进内存再过滤，这是第三轮
+ *     外部审计的 HIGH RISK 2，当时因为看不到 Productivity OS 的代码、
+ *     没法评估有没有更好的数据源，只能记成已知问题。拿到 Productivity OS
+ *     代码后确认：ActiveTasks 是它自己实时维护（不是定时批处理）、永远
+ *     只含当前非终态任务的表，完全符合"取待提醒候选"这个用途；但
+ *     reminder_count 的权威数据仍然只在 Tasks（ActiveTasks 上的同名列
+ *     不会被同步——Productivity OS 自己的 10_ProjectionEngine.gs 明确
+ *     跳过这一列；26_AnalyticsEngine.gs 的统计功能依赖 Tasks 全量任务的
+ *     reminder_count 历史值，不能改成只写 ActiveTasks），所以写边界
+ *     不变，只有读边界扩大。
+ *
+ *     这仍然是"只读、不写"关系，跟原有的"只读 Tasks"性质相同，没有反过来
+ *     要求 Productivity OS 改任何代码、没有新增任何写入目标，符合本条
+ *     一直以来的精神（读别的 Domain OS 的 Read Model 没问题，写只能碰
+ *     自己明确拥有的那几个字段）。完整决策依据（包括为什么不是"只写
+ *     ActiveTasks"、为什么不做整表归档）见
+ *     00_ADR_002_ReminderEngine_Audit_Fixes.txt「第三轮 HIGH RISK 2 后续
+ *     解决」。
  *
  * P4. 不变的东西（沿用 Core 宪法，历史记录）：
  *     2026-07-03 从 Core 拆分时：_shouldRemind 的判断逻辑（含当时已知的
