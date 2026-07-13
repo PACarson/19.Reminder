@@ -130,6 +130,13 @@ function runTemporalEngineTests() {
   check('calculateOccurrences: untilTime<=fromTime应返回空数组，不throw',
     emptyOcc, []);
 
+  // Disposition Review Finding 4（2026-07-13）：MAX_OCCURRENCES 硬上限之前
+  // 没有自动化测试覆盖。daily 规则跨 10 年多的区间，potential occurrence
+  // 数远超 1000（约3800+天），应该被截断在 1000，不 throw。
+  var wideRangeOcc = TemporalEngine.calculateOccurrences(daily, new Date(2016, 0, 1, 0, 0), new Date(2026, 6, 6, 0, 0));
+  check('calculateOccurrences: Performance Guard，超过1000个occurrence的范围应截断在1000，不throw',
+    wideRangeOcc.length, 1000);
+
   // ---------- isDue ----------
   check('isDue: 精确命中返回true', TemporalEngine.isDue(daily, new Date(2026, 6, 6, 9, 0)), true);
   check('isDue: 差1分钟返回false', TemporalEngine.isDue(daily, new Date(2026, 6, 6, 9, 1)), false);
@@ -142,10 +149,23 @@ function runTemporalEngineTests() {
   checkThrows('parseRule: weekly的day值超范围', function () { TemporalEngine.parseRule({ type: 'weekly', days_of_week: [9], time: '09:00' }); });
   checkThrows('parseRule: monthly的day_of_month超范围', function () { TemporalEngine.parseRule({ type: 'monthly', day_of_month: 35, time: '09:00' }); });
   checkThrows('parseRule: yearly的month超范围', function () { TemporalEngine.parseRule({ type: 'yearly', month: 13, day: 1, time: '09:00' }); });
+  // Disposition Review Finding 2（2026-07-13）：这两个组合在任何年份都
+  // 不可能存在（不是"闰年才有"的2/29那种），应该在parseRule阶段被拒绝，
+  // 不应该流到_nextYearly才因搜不到而失败。
+  checkThrows('parseRule: yearly不可能的日期组合（2/30，任何年份都不存在）', function () { TemporalEngine.parseRule({ type: 'yearly', month: 2, day: 30, time: '09:00' }); });
+  checkThrows('parseRule: yearly不可能的日期组合（4/31，4月最多30天）', function () { TemporalEngine.parseRule({ type: 'yearly', month: 4, day: 31, time: '09:00' }); });
   checkThrows('parseRule: every_n_days缺start_date', function () { TemporalEngine.parseRule({ type: 'every_n_days', interval: 3, time: '09:00' }); });
   checkThrows('parseRule: every_n_days的interval=0', function () { TemporalEngine.parseRule({ type: 'every_n_days', interval: 0, start_date: '2026-01-01', time: '09:00' }); });
   checkThrows('parseRule: daily不该接受interval=2', function () { TemporalEngine.parseRule({ type: 'daily', interval: 2, time: '09:00' }); });
   checkThrows('parseRule: time格式不对', function () { TemporalEngine.parseRule({ type: 'daily', time: '9:00' }); });
+
+  // ---------- calculateNextOccurrence 绕过 parseRule 的防御性测试 ----------
+  // Disposition Review Finding 1（2026-07-13）：不通过 parseRule、直接手工
+  // 构造一个 type 不在合法五种之内的 schedule 传进来，之前会静默返回
+  // undefined，现在应该 throw 一个说明清楚的错误。
+  checkThrows('calculateNextOccurrence: 绕过parseRule直接传入不合法type，应该throw而不是静默返回undefined', function () {
+    TemporalEngine.calculateNextOccurrence({ type: 'hourly', hour: 9, minute: 0 }, new Date(2026, 6, 6, 7, 0));
+  });
 
   // ---------- Immutable: Schedule Model 不应该被任何函数修改 ----------
   var scheduleForImmutabilityCheck = TemporalEngine.parseRule({ type: 'daily', time: '09:00' });

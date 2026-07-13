@@ -2,9 +2,11 @@
  * 00_ADR_004_Temporal_Engine_Design.gs
  * Reminder OS — 架构决策记录 #004
  *
- * STATUS: Accepted — Gate Review（A0→A1）已过，进入 A1 实现
+ * STATUS: Accepted — Gate Review（A0→A1）已过，A1 实现 + Disposition
+ * Review 的 Fix Now 项（Finding 1、2、4）已完成
  * DATE: 2026-07-06（初版），2026-07-06（同日修订：并入 Gate Review 确认
- * 的5点 + 4条精化，见文末「2026-07-06 修订记录」）
+ * 的5点 + 4条精化，见「2026-07-06 修订记录」），2026-07-13（Disposition
+ * Review 后的 Contract 补充，见文末「2026-07-13 修订记录」）
  */
 
 /**
@@ -166,6 +168,12 @@
  *     "调用方传的东西本身就不对"用 throw，"外部系统调用可能失败但输入
  *     合法"（比如 Output.sendMessage 调 Telegram API）才用
  *     {ok:false,...} 这种返回值。RuleSpec 校验属于前者。
+ *   - 【yearly 校验补充，Disposition Review Finding 2，2026-07-13】除了
+ *     month(1-12)、day(1-31) 各自的范围校验之外，还要校验 day 是否可能
+ *     出现在 month 里（按闰年评估，即 day=29,month=2 合法）。calendrically
+ *     不可能的组合（如 2/30、4/31——在任何年份都不存在，跟"闰年才有"的
+ *     2/29 是两回事）在这里 throw，不允许流入 calculateNextOccurrence
+ *     才因为 YEARLY_SEARCH_LIMIT 耗尽而失败，报出跟真实原因无关的错误。
  *   - 成功时返回上面定义的 Schedule Model（不可变，见上）。
  *   - 【Pure Function，2026-07-06 补充，Gate Review 关联】No IO. No
  *     Sheet access. No Logger.log. No PropertiesService/SecureConfig.
@@ -182,6 +190,13 @@
  *     返回的对象，fromTime 是合法 Date）时，这个函数保证不会 throw。
  *     校验职责全部在 parseRule 一次性做完，这里不重复校验、不会因为
  *     "看起来奇怪的数据"意外抛错。
+ *   - 【schedule.type 不合法时的行为，Disposition Review Finding 1，
+ *     2026-07-13】上面这条"输入合法时不 throw"的承诺，反过来说：如果
+ *     schedule.type 不属于 parseRule 输出的五种合法类型之一（调用方绕过
+ *     了 parseRule，或者传入的对象根本不是真正的 ScheduleModel），函数
+ *     throw 一个具名错误，不静默返回 undefined。这不是对上面承诺的例外——
+ *     按定义，合法的 ScheduleModel 的 type 只可能是这五种之一，所以这种
+ *     情况从一开始就不算"输入合法"。
  *   - 【边界情况，已决定】type='monthly' 且 dayOfMonth=31，遇到没有31号
  *     的月份（4/6/9/11月）或者29/30号遇到没有那天的月份（比如2月，含
  *     闰年判断——闰年2月29号存在、平年不存在，这个函数要能正确处理）：
@@ -386,4 +401,38 @@
  * - 如果实现过程中发现这份 Contract 有问题，直接回来修订这份 ADR-004
  *   （更新 DATE +「修订记录」），这正是 Contract → Implementation →
  *   Feedback 这个流程该发挥作用的地方。
+ *
+ * === 2026-07-13 修订记录 ===
+ *
+ * UEF Architecture Review（Engine Profile，2026-07-12）产出 Gate:
+ * Conditional Go，4个LOW finding。Disposition Review（2026-07-13，见独立
+ * 文档《Reminder-OS_LOW-Findings-Disposition_2026-07-12.md》）逐条评估后：
+ *   1. parseRule 新增 yearly day-in-month 校验（Finding 2，Fix Now，已
+ *      实现）——见上面 parseRule 小节新增的对应条目
+ *   2. calculateNextOccurrence 新增 schedule.type 不合法时的 throw 行为
+ *      （Finding 1，Fix Now，已实现）——见上面对应小节新增的条目
+ *   3. Finding 3（Object.freeze 未强制 immutability）：disposition 结论
+ *      Fix Later，不在这次修订范围。理由跟「考虑过没采纳 timezone 参数」
+ *      是同一个逻辑——目前零调用方，保护的场景还不存在；等 TemporalEngine
+ *      有了第一个真实调用方再回来做。这份 Contract 不需要为此改动，因为
+ *      Contract 本来就已经写明 Schedule Model immutable，Finding 3 缺的
+ *      是 runtime 强制，不是 Contract 本身有漏洞，所以不算 Contract 修订。
+ *   4. Finding 4（MAX_OCCURRENCES 缺自动化测试）：disposition 结论
+ *      Fix Now，已实现，纯测试新增，不改 Contract 也不改实现。
+ *
+ * === 后果（2026-07-13 更新）===
+ *
+ * - Finding 1、2、4 已实现并验证：12_TemporalEngine.gs + 5_Testing/
+ *   50_TemporalEngine_Tests.gs，测试从 39/39 增加到 43/43（Finding 1 一条
+ *   回归测试 + Finding 2 两条回归测试 + Finding 4 一条 Performance Guard
+ *   测试），全部通过——用独立的 Node harness 实际跑过一次，不是改完代码
+ *   直接假设没问题。
+ * - 就 Gate Review 明确写的 Condition（"fix Findings 1 and 2 before
+ *   anything begins depending on the current permissive behavior"）而言，
+ *   这次修订已经满足；Finding 3 维持 Fix Later，本来就不在 Condition
+ *   范围内，不影响 Gate 从 Conditional Go 走向 Go。
+ * - Phase A 的 Exit Criteria 本来就已在 2026-07-06 全部满足，这次修的是
+ *   Gate Review 额外发现的边界情况，不重新打开 Exit Criteria 本身。
+ * - Phase B（Reminder Scheduler，recurring reminder）依然按 Progression
+ *   Rule 不自动开始，需要真实需求驱动，这次修订不改变这一点。
  */

@@ -54,6 +54,39 @@ Re-confirmed against `00_Project_Constitution.gs` P1–P3, not assumed: Reminder
 
 ---
 
+## 2.1 Future-Proof Domain Boundary Validation — Reminder OS vs. Calendar OS
+
+**Formal boundary, now governance rather than implicit:**
+
+| Reminder OS owns | Belongs to a future Calendar OS instead |
+|---|---|
+| reminder rules | meetings |
+| reminder schedule | calendar events |
+| reminder queue | recurring calendar schedules |
+| reminder history | time blocking |
+| notification channels | availability analysis |
+| reminder lifecycle | free/busy management |
+| | Google Calendar synchronization |
+
+**The reusable test, so future feature requests don't need this reasoning re-derived from scratch:** does the feature need to know **what else is happening at a given time** — a meeting, an event, someone's busy/free status? → Calendar OS's job. Does it only need to know **when to fire**, based on data another domain already owns (a task's `due_datetime`, a fixed clock window)? → Reminder OS's job. Reminder OS answers "when should a notification go out about something"; it never answers "what's on the calendar" or "is this moment available."
+
+**Auditing every feature in this design against that test:**
+
+- `ReminderRules`/`ReminderOccurrences`/`ReminderHistory`, the lifecycle states, retry/duplicate-prevention, the adapter contract — all pure reminder-delivery bookkeeping. None represents an event, a meeting, an attendee, a location, or a duration. Clean.
+- Reading `due_datetime` from Productivity OS — this reads a **task's** deadline, not a calendar event. Reminder OS doesn't create, hold, or reason about calendar entries; it consumes a single timestamp another domain already owns, exactly as it consumes `chat_id` or `status` today. Clean, and this is worth generalizing (see worked example below).
+- The auto-default-rules mechanism, config, trigger strategy, migration plan — infrastructure and configuration, no calendar concept anywhere in them. Clean.
+
+**Two points close enough to the line that they need the distinction stated explicitly, not just assumed:**
+
+1. **Quiet Hours is a fixed clock window, not availability analysis.** `QUIET_HOURS_START_HOUR`/`END_HOUR` (§5) never reads a calendar, never checks whether a meeting is happening, never computes busy/free — it's a static, configured "don't be noisy between these hours" gate, the same category of feature as a phone's Do Not Disturb schedule. If a future request asks for *"don't remind me while I'm actually in a meeting"* — that's dynamic, calendar-derived availability, and it belongs to Calendar OS, not an extension of Quiet Hours. The correct integration then would mirror the one already established with Productivity OS: Calendar OS computes and publishes a "currently busy" signal on a shared sheet, and Reminder OS's delivery gate reads that signal the same way it reads `due_datetime` today — it would never read Google Calendar or compute meeting overlaps itself.
+2. **`TemporalEngine`'s "recurring schedule" is a date-math utility, not a "recurring calendar schedule."** It answers "when does this repeating pattern next trigger" with zero knowledge of meetings, attendees, locations, or durations — that's precisely why ADR-004 designed it to be reusable by Finance OS and Vehicle OS. If a future Calendar OS ever reuses `TemporalEngine` to compute "next Tuesday 3pm," that doesn't make `TemporalEngine` — or Reminder OS, which happens to use the same file today — an owner of calendar concepts. `TemporalEngine` is domain-agnostic Foundation-layer infrastructure; using it doesn't transfer ownership of what it's used *for*.
+
+**Worked example, since an abstract rule is easier to apply with one:** *"remind me 15 minutes before my meeting"* is a plausible future request. If "my meeting" is already represented as a task-like record with a `due_datetime` — whether that's a Productivity OS task or a future Calendar OS publishing "next meeting starts at X" the same way Productivity OS publishes a due date — this is squarely Reminder OS's job, identical in shape to everything already designed here. It only crosses into Calendar OS territory the moment Reminder OS itself would need to read Google Calendar, resolve which meeting is "next," or handle an organizer's reschedule — none of which this design does or should do.
+
+**Conclusion: no redesign required.** Nothing in this design currently crosses the boundary. The two points above get their distinction written down explicitly (here, and worth carrying into the Constitution — see the accompanying governance update) specifically so a *future* feature request doesn't quietly drift across it by extending Quiet Hours or `TemporalEngine` usage in a way that seems like a small step from where they already are.
+
+---
+
 ## 3. Data Model (revised — Rule / Occurrence / History)
 
 You asked me to evaluate Rule / Schedule / History / Queue (or another shape) and explain trade-offs rather than default to what exists. Here's the reasoning, including where it changed this round.
@@ -111,7 +144,7 @@ Now genuinely bounded, not just targeted-read-bounded: a row lives here only whi
 
 **SNOOZED — reserved, not implemented (your point 4).** Added `snoozed` to the status enum plus a companion `snoozed_until` field — a status alone can't represent "snoozed until when," so reserving the field alongside it is what makes the reservation actually usable later without a schema migration. Intended future semantics: `pending → snoozed` on a user action (a future third button, not V1's current Done/Snooze-1h pair), `snoozed → pending` once `snoozed_until` elapses. Nothing in this design currently writes or reads either — flagging that I've extended your ask slightly (the field, not just the enum value) since the status alone isn't meaningful without it; happy to strip the field back out if you'd rather reserve only the label.
 
-**Default rule generation — config-driven, not hardcoded (your point 1).** `DEFAULT_REMINDER_OFFSETS_MINUTES` becomes a top-of-file named constant in `26_ReminderOffsetEngine.gs`, matching this codebase's existing convention for tunable parameters (`REMINDER_ADVANCE_HOURS`, `REMINDER_INTERVAL_HOURS`, `MAX_RETRY_ATTEMPTS` are all the same shape — a named constant, not a value buried in logic, and not promoted to `SecureConfig` either, which this project reserves for secrets/environment values rather than business-tuning knobs). Proposing `[1440, 60, 15]` as the default (your own -1 day/-1 hour/-15 min example), with an empty array meaning "auto-generation disabled" — one config surface controls both the values and the on/off switch, rather than a separate boolean next to it. If you'd rather this be tunable at runtime without a redeploy, `SecureConfig` is a reasonable alternative — it costs a `JSON.stringify`/`parse` round trip a plain constant doesn't need. I'd default to the constant given every existing tunable parameter here already works that way, but flagging the choice rather than deciding it silently (open item below).
+**Default rule generation — config-driven, not hardcoded (your point 1). Constant confirmed, not `SecureConfig`.** `DEFAULT_REMINDER_OFFSETS_MINUTES` is a top-of-file named constant in `26_ReminderOffsetEngine.gs`, matching this codebase's existing convention for tunable parameters (`REMINDER_ADVANCE_HOURS`, `REMINDER_INTERVAL_HOURS`, `MAX_RETRY_ATTEMPTS` are all the same shape — a named constant, not a value buried in logic). Deliberately not `SecureConfig`: this is default system behavior, not a secret or environment value, so it belongs with everything else this codebase already tunes the same way. Default value `[1440, 60, 15]` (your own -1 day/-1 hour/-15 min example), with an empty array meaning "auto-generation disabled" — one config surface controls both the values and the on/off switch. If runtime tuning without a redeploy is ever actually needed, migrating this one constant to `SecureConfig` later is a small, contained change — no reason to pay that cost now for a need that hasn't shown up.
 
 ---
 
@@ -165,7 +198,7 @@ Worth reserving now rather than bolting on later: it's a small, contained gate o
 
 **Config:** `QUIET_HOURS_START_HOUR` / `QUIET_HOURS_END_HOUR` (24h local time, e.g. `22` and `8`) — same sentinel convention as the default-offsets config in §3: unset/`null` means disabled. One config pattern reused across both features rather than a separate boolean per feature.
 
-**Open product question, not decided here:** should an already-overdue task's reminder bypass Quiet Hours — urgency overriding "don't wake me" — or should everything defer uniformly with no exception? That's a judgment call about how you want to actually use the system, not an architecture question. Flagged as an open item below rather than picked for you.
+**Overdue-bypass question: deferred by decision, not left dangling.** Same disposition shape as Part 1's Finding 3 (`Object.freeze`) — there's no real usage data yet to justify picking either answer, so rather than guessing, the decision is explicitly postponed until Reminder OS has actually run for a while and there's real behavior to reason from. The re-trigger condition is exactly that: once real usage experience exists, come back and decide. Nothing about the config or algorithmic seam is blocked by this — both stay reserved and ready either way.
 
 **Scope for this round:** reserve the config surface and the algorithmic seam (already free, per above). Not building the actual time-window check itself until you confirm you want it active in V1 — turning it on later is a small, local change specifically because the seam already exists; there's nothing to retrofit.
 
@@ -276,20 +309,20 @@ Not applicable. Nothing in this initiative plans, predicts, or learns — it com
 
 ---
 
-## Decisions Confirmed This Round
+## Decisions Confirmed
 
-- **Default rule generation**: confirmed — auto-generate `DEFAULT_REMINDER_OFFSETS_MINUTES` (proposed default `[1440, 60, 15]`) for any task first seen with due-datetime info and no existing rules; config-driven and disabled by an empty array, not hardcoded (§3).
-- **Rule / Occurrence / History separation**: confirmed and implemented in this revision, superseding the earlier two-table recommendation (§3, §4, §5).
-- **Offset-only Rules, always-recomputed Occurrences**: confirmed — already the design; no change needed (§3).
+- **Default rule generation**: auto-generate `DEFAULT_REMINDER_OFFSETS_MINUTES` (default `[1440, 60, 15]`) for any task first seen with due-datetime info and no existing rules; config-driven, disabled by an empty array.
+- **Rule / Occurrence / History separation**: confirmed, superseding the earlier two-table recommendation — matches the `Tasks`/`ActiveTasks` precedent, keeps the hot table bounded (§3, §4, §5).
+- **Offset-only Rules, always-recomputed Occurrences**: already the design; no change needed (§3).
 - **SNOOZED status**: reserved in the enum plus a `snoozed_until` field, not implemented (§3, §4).
-- **Channel adapters**: formalized as an explicit `{ name, send() }` contract behind a small lookup object; Telegram-only implemented (§10 file map).
-- **Quiet Hours**: seam and config reserved; the check itself not built pending confirmation it should be active (§5).
+- **Channel adapters**: explicit `{ name, send() }` contract behind a small lookup object; Telegram-only implemented (§10 file map).
+- **Quiet Hours**: config and algorithmic seam reserved; the check itself not built for V1 (§5).
+- **Quiet-Hours overdue-bypass**: explicitly deferred, not decided now — same disposition shape as Part 1's Finding 3: no real usage data exists yet to justify either answer, so the decision waits until Reminder OS has actually run and there's real behavior to reason from. Re-trigger condition: real usage experience (§5).
+- **Default-offsets storage: `Constant`, not `SecureConfig`** — this is default system behavior, not a secret, so it belongs with every other tunable parameter in this codebase (`REMINDER_ADVANCE_HOURS`, `REMINDER_INTERVAL_HOURS`, `MAX_RETRY_ATTEMPTS`). Migrating to `SecureConfig` later, if redeploy-free tuning ever becomes a real need, is a small contained change — no reason to pay that cost now (§3).
 
-## Open Items Requiring Your Confirmation
+## Open Items — all four remaining require external input, not further architectural judgment
 
 1. Productivity OS's actual `due_time`/`due_datetime` schema (§2) — this design cannot be verified correct without it.
 2. Separate vs. unified trigger for V1 vs. the new engine (§6).
 3. Whether/how to extend the Telegram callback contract for per-occurrence Snooze, and coordinating that with Personal AI Core (§2).
 4. ADR numbering for this document once approved.
-5. Whether Quiet Hours should actually be active in V1, and if so, whether an already-overdue task's reminder should bypass it (§5).
-6. Whether `DEFAULT_REMINDER_OFFSETS_MINUTES` should be a plain top-of-file constant (matches every existing tunable parameter in this codebase) or promoted to `SecureConfig` for redeploy-free tuning (§3) — recommending the former, flagging the alternative.

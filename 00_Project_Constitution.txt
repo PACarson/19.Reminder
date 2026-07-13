@@ -5,7 +5,10 @@
  * 平台级原则的权威定义在 Personal AI Core 项目的
  * 00_Project_Constitution.gs，这里只放这个 OS 自己的东西。
  *
- * LAST_UPDATED: 2026-07-11 — 修订 P3（读边界从"只读 Tasks"扩大为"读
+ * LAST_UPDATED: 2026-07-13 — 新增 P8（演进原则：保守优先，Claude 架构
+ * 复审会话固定应用的默认立场）；新增 P9（领域边界：Reminder OS 不是
+ * Calendar OS，Future-Proof Architecture Validation 结论）。
+ * 2026-07-11 — 修订 P3（读边界从"只读 Tasks"扩大为"读
  * ActiveTasks 取候选+对 Tasks 定点查 reminder_count/last_reminder_at"，
  * 解决第三轮外部审计遗留的 HIGH RISK 2）；同步修订 P1 的表述。
  * 2026-07-10 — 修订 P3（写入机制细化为定点字段更新+Events
@@ -166,4 +169,59 @@
  *     （单一 ReminderEngine，只认 due_date + priority 这一种规则形状）。
  *     File_Map.gs 里没有为此新增任何"预留"资料夹——范围还没有拍板，不
  *     提前建看起来像是"已经决定"的结构。
+ *
+ * P8. 演进原则：保守优先（2026-07-13 新增）
+ *     架构复审、disposition review、新阶段设计评估中，建议"修"或"不修"、
+ *     "现在做"或"以后做"时，默认偏向少做——一项改动只有在能清楚说明具体
+ *     解决了什么问题、关闭了什么风险敞口时才建议 Fix Now/现在做；如果理由
+ *     只是"更完整""更规范""以防万一"，且没有真实调用方或真实风险场景
+ *     支撑，应该建议 Fix Later/Won't Fix，并明确写出触发重新评估的条件是
+ *     什么（不能只是"以后再说"，要说清楚"以后"具体指什么发生的时候）。
+ *
+ *     这条原则不新增任何判断维度，是把 00_ADR_003 的 Progression Rule、
+ *     00_ADR_004"考虑过但没采纳 timezone 参数"那类判断，从"针对单个 ADR
+ *     的具体决定"提升为这个项目一贯适用的评审默认立场，供以后每一次
+ *     架构复审直接引用，不用每次重新论证一遍"为什么要保守"。
+ *
+ *     原话，保留请求者措辞（比照 00_ADR_003 对三个 Open Questions 保留
+ *     英文措辞的先例）：
+ *     "Please be conservative. Only recommend fixes that materially
+ *     improve the architecture. Avoid polishing changes that increase
+ *     complexity without meaningful long-term benefit."
+ *
+ * P9. 领域边界：Reminder OS 不是 Calendar OS（2026-07-13 新增，
+ *     Future-Proof Architecture Validation 结论）
+ *     Reminder OS 拥有：reminder rules、reminder schedule、reminder
+ *     queue、reminder history、notification channels、reminder
+ *     lifecycle。
+ *
+ *     Reminder OS 不拥有，属于未来 Calendar OS：meetings、calendar
+ *     events、recurring calendar schedules、time blocking、
+ *     availability analysis、free/busy management、Google Calendar
+ *     synchronization。
+ *
+ *     判断测试：这个功能需不需要知道"某个时间点上正在发生什么"（会议、
+ *     事件、忙闲状态）？需要 → Calendar OS 的事。这个功能只需要知道
+ *     "该在什么时候触发"，且触发时机来自别的领域已经拥有的数据（一个
+ *     任务的 due_datetime、一个固定的时钟窗口）？→ Reminder OS 的事。
+ *     Reminder OS 回答"该在什么时候就某件事发通知"，不回答"日历上有
+ *     什么"或"此刻是否可用"。
+ *
+ *     两个容易被误认为"只是往前走一小步"、需要显式划线的点（完整推理见
+ *     Time-Based Offset Reminder Engine 设计文档 §2.1）：
+ *       - Quiet Hours（固定时钟窗口，如22:00-08:00）属于 reminder
+ *         lifecycle，不是 availability analysis——它不读日历、不判断
+ *         "此刻是否有会议"。如果以后真的需要"开会时不提醒"这种基于真实
+ *         日历数据的动态判断，那是 Calendar OS 该做的事：由 Calendar OS
+ *         计算并发布一个"当前忙碌"信号（沿用本条 P1 那套"新 Domain OS
+ *         加一段查询逻辑"模式），Reminder OS 最多是读这个信号，不会自己
+ *         去读 Google Calendar 或做会议冲突判断。
+ *       - 1_Foundation/12_TemporalEngine.gs 的"recurring schedule"计算
+ *         是通用日期数学工具，不是"recurring calendar schedule"——它不
+ *         知道会议、与会人、地点、时长。即使未来的 Calendar OS 复用
+ *         TemporalEngine 算"下一次周二3点"，TemporalEngine 本身依然不
+ *         因此变成 Calendar 概念的拥有者，就跟它现在被 Reminder OS
+ *         用、也不代表 TemporalEngine 归 Reminder OS 所有一样——它是
+ *         没有领域归属的 Foundation 层基础设施（见 00_ADR_004
+ *         Dependency Rule）。
  */

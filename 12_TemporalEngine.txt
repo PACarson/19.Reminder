@@ -11,6 +11,12 @@
  * Finance OS/Vehicle OS 等全新项目里直接跑，不需要带着本项目的其他文件
  * 一起搬。Pure Function：无 IO、无 Logger、不读当前时间，只用传入的参数
  * 计算，同样的输入永远得到同样的输出。
+ *
+ * 2026-07-13 补丁：UEF Disposition Review 的 Fix Now 项（Finding 1、
+ * Finding 2）。不涉及 Contract 支持的五种 type、不涉及 V1 已确定的行为
+ * （闰年跳过、31号月末溢出等），纯粹是收紧对"不合法输入"的处理——
+ * 详见各自改动点旁的注释。Finding 3（Object.freeze）按 disposition 结论
+ * Fix Later，这份补丁不包含。
  */
 
 var TemporalEngine = (function () {
@@ -130,6 +136,16 @@ var TemporalEngine = (function () {
       if (!_isInt(ruleSpec.day) || ruleSpec.day < 1 || ruleSpec.day > 31) {
         throw new Error('TemporalEngine.parseRule: yearly 需要 day 是 1-31 的整数，收到: ' + ruleSpec.day);
       }
+      // Disposition Review Finding 2（2026-07-13）：day 是否可能出现在
+      // month 里，按闰年评估（2000年是闰年，用它做基准，2/29在这里合法）。
+      // 不合法组合（如 2/30、4/31——在任何年份都不可能存在）在这里 throw，
+      // 不再流入 _nextYearly 才因 YEARLY_SEARCH_LIMIT 耗尽而失败，报出
+      // 跟真实原因无关的错误信息。合法但年份相关的情况（2/29遇到平年）
+      // 不受影响，继续交给 _nextYearly 的"跳过不含这天的年份"处理。
+      if (ruleSpec.day > _daysInMonth(2000, ruleSpec.month - 1)) {
+        throw new Error('TemporalEngine.parseRule: yearly 的 month=' + ruleSpec.month + ' 不可能有 day=' +
+          ruleSpec.day + '（该月最多' + _daysInMonth(2000, ruleSpec.month - 1) + '天，按闰年评估）');
+      }
       schedule.month = ruleSpec.month;
       schedule.day = ruleSpec.day;
     }
@@ -154,8 +170,17 @@ var TemporalEngine = (function () {
         return _nextMonthly(schedule, from);
       case 'yearly':
         return _nextYearly(schedule, from);
+      default:
+        // Disposition Review Finding 1（2026-07-13）：合法的 ScheduleModel
+        // 按定义只可能是以上五种 type 之一——能走到这里，说明 schedule
+        // 不是 parseRule 的输出（调用方绕过了 parseRule 直接构造/传入对象，
+        // 或者未来新增了 type 但漏改这里的 switch）。throw 而不是静默
+        // 返回 undefined：不违反 Contract"输入合法时保证不 throw"的
+        // 承诺——按 Contract 定义，不合法的 ScheduleModel 从一开始就
+        // 不算"输入合法"，所以这里 throw 是这个承诺的延伸，不是例外。
+        throw new Error('TemporalEngine.calculateNextOccurrence: schedule 不是合法的 ScheduleModel（schedule.type="' +
+          (schedule && schedule.type) + '"），必须是 parseRule() 的返回值');
     }
-    // 不会走到这里：schedule 保证是 parseRule 校验过的合法对象
   }
 
   function _nextDaily(schedule, from) {
