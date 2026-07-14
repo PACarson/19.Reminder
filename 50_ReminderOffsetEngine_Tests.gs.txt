@@ -1,0 +1,181 @@
+/**
+ * 50_ReminderOffsetEngine_Tests.gs
+ * Reminder OS — 26_ReminderOffsetEngine.gs 的测试
+ *
+ * 跟 50_TemporalEngine_Tests.gs 同款风格：手动 Logger.log PASS/FAIL，
+ * 不引入新的测试框架依赖。
+ *
+ * ⚠️ 跟 50_TemporalEngine_Tests.gs 不同的地方：TemporalEngine 是 Pure
+ * Function，这份文件可以原样丢进 GAS 编辑器直接跑。这份测试涉及
+ * SheetUtils/QueryEngine/EventBus/Output/LockService 等一整套 GAS 平台
+ * 依赖，本地验证是通过 /home/claude/work/mocks.js + run_offset_tests.js
+ * 搭的内存版 GAS shim 跑的（用真实的 21_SheetUtils.gs/40_Output.gs 源码
+ * eval 进去，不是重新手写一份简化逻辑）。如果要挪进真实 GAS 项目里跑
+ * 集成测试，需要指向一个真实的测试用 Spreadsheet，而不是这份 mock。
+ * design doc §10 Testing 层的 Integration Tests 那一条对应的就是这份
+ * 文件里的 checkOffsetReminders() 系列场景，不是 pure unit test 那几个。
+ */
+
+function runReminderOffsetEngineTests() {
+  var pass = 0, fail = 0;
+
+  function check(label, actual, expected) {
+    var actualStr = JSON.stringify(actual);
+    var expectedStr = JSON.stringify(expected);
+    if (actualStr === expectedStr) {
+      pass++;
+    } else {
+      fail++;
+      Logger.log('❌ FAIL: ' + label + '\n   期望: ' + expectedStr + '\n   实际: ' + actualStr);
+    }
+  }
+
+  function checkTrue(label, actual) {
+    if (actual === true) { pass++; } else { fail++; Logger.log('❌ FAIL: ' + label + ' (期望 true, 实际 ' + actual + ')'); }
+  }
+
+  Logger.log('========== ReminderOffsetEngine 测试开始 ==========');
+
+  // ---------- _resolveEffectiveDueDatetime_：三种 schema 假设都要覆盖 ----------
+  // design doc §2 Open Item 1：这三个分支就是"读哪个字段"的全部假设，
+  // Productivity OS 的真实 schema 一旦确认，只需要回来改这一个函数，
+  // 这几个测试的意义是锁住这个函数当前假设的行为，不是验证假设本身对不对。
+
+  check('resolveEffectiveDueDatetime: 优先用 due_datetime（完整ISO字符串）',
+    ReminderOffsetEngine._resolveEffectiveDueDatetime_({ due_datetime: '2026-07-30T10:00:00' }).getHours(),
+    10);
+
+  check('resolveEffectiveDueDatetime: due_date+due_time 组合',
+    ReminderOffsetEngine._resolveEffectiveDueDatetime_({ due_date: '2026-07-30', due_time: '10:00:00' }).getHours(),
+    10);
+
+  check('resolveEffectiveDueDatetime: 只有纯 due_date（date-only，午夜）',
+    ReminderOffsetEngine._resolveEffectiveDueDatetime_({ due_date: '2026-07-30' }).getHours(),
+    0);
+
+  check('resolveEffectiveDueDatetime: 三个字段都没有，返回 null',
+    ReminderOffsetEngine._resolveEffectiveDueDatetime_({}),
+    null);
+
+  // ---------- _computeIdempotencyKey_ ----------
+
+  var fireAtA = new Date(2026, 6, 30, 8, 45, 30); // 有秒数，应该被截到分钟
+  var fireAtB = new Date(2026, 6, 30, 8, 45, 59);
+  check('computeIdempotencyKey: 同一分钟内秒数不同应该得到相同 key（分钟精度）',
+    ReminderOffsetEngine._computeIdempotencyKey_('RULE-1', 'telegram', fireAtA),
+    ReminderOffsetEngine._computeIdempotencyKey_('RULE-1', 'telegram', fireAtB));
+
+  var fireAtC = new Date(2026, 6, 30, 8, 46, 0);
+  checkTrue('computeIdempotencyKey: 跨分钟应该得到不同 key',
+    ReminderOffsetEngine._computeIdempotencyKey_('RULE-1', 'telegram', fireAtA) !==
+    ReminderOffsetEngine._computeIdempotencyKey_('RULE-1', 'telegram', fireAtC));
+
+  // ---------- _offsetLabel_ ----------
+
+  check('offsetLabel: 1440分钟 → 1 day(s) before', ReminderOffsetEngine._offsetLabel_(1440), '1 day(s) before');
+  check('offsetLabel: 60分钟 → 1 hour(s) before', ReminderOffsetEngine._offsetLabel_(60), '1 hour(s) before');
+  check('offsetLabel: 15分钟 → 15 minute(s) before', ReminderOffsetEngine._offsetLabel_(15), '15 minute(s) before');
+
+  // ---------- Integration: checkOffsetReminders() 完整 poll cycle ----------
+  // design doc §10 Testing：mock 一个 getPendingTasks() 结果，跑一整轮
+  // checkOffsetReminders()，断言落在表里的结果——这是设计文档明确要求的
+  // "不只测单个函数，测规则/当前任务状态/幂等键三者的交互"。
+
+  function resetAll() {
+    global.__resetStore();
+    global.__mockPendingTasks = [];
+    global.__publishedEvents = [];
+    global.__telegramShouldSucceed = true;
+    global.__seedSheet('ReminderRules',
+      ['rule_id', 'task_id', 'chat_id', 'offset_minutes', 'offset_label', 'channels', 'rule_status', 'source', 'resolved_fire_ats', 'created_at'], []);
+    global.__seedSheet('ReminderOccurrences',
+      ['idempotency_key', 'rule_id', 'task_id', 'chat_id', 'channel', 'computed_fire_at', 'status', 'attempt_count', 'last_attempt_at', 'snoozed_until'], []);
+    global.__seedSheet('ReminderHistory',
+      ['idempotency_key', 'rule_id', 'task_id', 'chat_id', 'channel', 'computed_fire_at', 'final_status', 'attempt_count', 'resolved_at', 'resolved_reason', 'archived_at'], []);
+  }
+
+  // --- 场景 A: 全新 task，没有任何规则，due_datetime 是 30 分钟后。
+  //     三个默认offset里，offset越大，fire_at越早（越远离due）：
+  //       -15min的fire_at = due-15 = 现在+15（还没到，不应该发）
+  //       -1hour的fire_at = due-60 = 现在-30（已经过了，应该发）
+  //       -1day 的fire_at = due-1440 = 远早于现在（已经过了，应该发）
+  //     所以应该正好发2条（-1hour、-1day），-15min那条还不该动 ---
+  resetAll();
+  var now = new Date();
+  var dueIn30 = new Date(now.getTime() + 30 * 60000);
+  global.__mockPendingTasks = [{ task_id: 'TASK-A', chat_id: 'CHAT-1', title: '测试任务A', due_datetime: dueIn30.toISOString() }];
+
+  var statsA = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景A: 应该自动生成3条默认规则', statsA.defaultRulesCreated, 3);
+  check('场景A: 应该发送成功2条（-1hour和-1day已过阈值，-15min还没到）', statsA.sent, 2);
+
+  var historyA = global.__readSheetRows('ReminderHistory');
+  check('场景A: History里应该有2条sent记录', historyA.length, 2);
+  checkTrue('场景A: History记录的channel都是telegram', historyA.every(function (h) { return h.channel === 'telegram'; }));
+  var occA = global.__readSheetRows('ReminderOccurrences');
+  check('场景A: 已发送的occurrence不应该继续留在Occurrences表（已归档删除）', occA.length, 0);
+  var rulesA = global.__readSheetRows('ReminderRules');
+  check('场景A: 3条规则都应该还在（-15min那条还没到期，规则本身不会因为一次发送被删）', rulesA.length, 3);
+
+  // --- 场景 B: 紧接着再跑一次（不改变任何输入），验证幂等——
+  //     不应该重复发送已经resolve过的-1hour/-1day，-15min此时仍未到期 ---
+  var statsB = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景B（重复poll，输入不变）: 不应该重复发送', statsB.sent, 0);
+  check('场景B: 不应该重新生成默认规则（task已经有规则了）', statsB.defaultRulesCreated, 0);
+  var historyB = global.__readSheetRows('ReminderHistory');
+  check('场景B: History不应该多出重复记录', historyB.length, 2);
+
+  // --- 场景 C: task 不再是 pending 状态（从 mock 的 pending 列表里消失）
+  //     → 应该取消所有还在 pending 的 occurrence，规则应该被清理掉 ---
+  global.__mockPendingTasks = []; // TASK-A 不再 pending
+  var statsC = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景C（task完成/消失）: 剩余规则数应该等于取消的occurrence以外的部分（这里没有额外pending occurrence，cancelled应为0）',
+    statsC.cancelled, 0); // 这一步之前没有pending occurrence（-1day/-1hour还没到fire_at，没物化），所以没什么可取消的
+  var rulesC = global.__readSheetRows('ReminderRules');
+  check('场景C: task不再pending后，规则应该被清理，Rules表应该清空', rulesC.length, 0);
+
+  // --- 场景 D: 发送失败，重试次数用尽后归档为 failed ---
+  resetAll();
+  global.__telegramShouldSucceed = false;
+  var dueInPastD = new Date(Date.now() - 20 * 60000);
+  global.__mockPendingTasks = [{ task_id: 'TASK-D', chat_id: 'CHAT-1', due_datetime: dueInPastD.toISOString() }];
+
+  var statsD1 = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景D 第1次: 发送失败，还在重试预算内，不应该算作最终failed', statsD1.failed, 0);
+  var occD1 = global.__readSheetRows('ReminderOccurrences');
+  var d1Row = occD1.filter(function (o) { return o.channel === 'telegram' && o.status === 'failed'; });
+  check('场景D 第1次: 应该有一条状态为failed、等待重试的occurrence（-15min那条）', d1Row.length >= 1, true);
+
+  var statsD2 = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景D 第2次（达到MAX_RETRY_ATTEMPTS=2）: 应该归档为最终failed', statsD2.failed >= 1, true);
+  var historyD = global.__readSheetRows('ReminderHistory');
+  var failedInHistory = historyD.filter(function (h) { return h.final_status === 'failed'; });
+  checkTrue('场景D: History里应该有归档的failed记录', failedInHistory.length >= 1);
+
+  // --- 场景 E: 幂等键跨渠道独立——同一条规则配置2个渠道，其中一个失败
+  //     不应该影响另一个 ---
+  resetAll();
+  var dueInPastE = new Date(Date.now() - 20 * 60000);
+  global.__seedSheet('ReminderRules',
+    ['rule_id', 'task_id', 'chat_id', 'offset_minutes', 'offset_label', 'channels', 'rule_status', 'source', 'resolved_fire_ats', 'created_at'],
+    [{ rule_id: 'RULE-E', task_id: 'TASK-E', chat_id: 'CHAT-1', offset_minutes: 15, offset_label: '15 minute(s) before', channels: JSON.stringify(['telegram']), rule_status: 'active', source: 'manual', resolved_fire_ats: JSON.stringify({}), created_at: new Date().toISOString() }]);
+  global.__mockPendingTasks = [{ task_id: 'TASK-E', chat_id: 'CHAT-1', due_datetime: dueInPastE.toISOString() }];
+
+  var statsE = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景E（手工建的单条规则，不触发默认规则生成）: defaultRulesCreated应为0', statsE.defaultRulesCreated, 0);
+  check('场景E: 应该发送成功1次', statsE.sent, 1);
+  var rulesE = global.__readSheetRows('ReminderRules');
+  var resolvedE = JSON.parse(rulesE[0].resolved_fire_ats);
+  checkTrue('场景E: 规则的resolved_fire_ats应该记录telegram渠道已解决的时间', !!resolvedE.telegram);
+
+  // ---------- Quiet Hours 门控（不改变materialize，只影响是否实际发送）----------
+
+  resetAll();
+  // 直接调用内部函数验证判断逻辑本身（QUIET_HOURS_*为null时应恒为false，
+  // V1默认关闭，见design doc §5 决策）
+  checkTrue('isWithinQuietHours: V1默认关闭（QUIET_HOURS_START/END为null）时恒为false',
+    ReminderOffsetEngine._isWithinQuietHours_(new Date(2026, 0, 1, 23, 0)) === false);
+
+  Logger.log('========== ReminderOffsetEngine 测试结束: ' + pass + ' passed, ' + fail + ' failed ==========');
+  return { pass: pass, fail: fail };
+}

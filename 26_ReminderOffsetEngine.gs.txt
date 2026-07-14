@@ -1,0 +1,546 @@
+/**
+ * 26_ReminderOffsetEngine.gs
+ * Reminder OS — Time-Based Offset Reminder Engine（V1 实现）
+ *
+ * 设计依据：Reminder-OS_Time-Based-Reminder-Engine_Design-Proposal.md
+ * （§3 Data Model / §4 Lifecycle / §5 Scheduling Algorithm / §10）。这里
+ * 只是实现，设计理由不重复贴，只在"写代码时才暴露出来、设计文档没预见到"
+ * 的地方加注释。
+ *
+ * 职责边界（00_Project_Constitution.gs P9）：只回答"该在什么时候就一个
+ * 已经存在的 task 发通知"，不碰 task 数据本身（只读 task_id、chat_id、
+ * due_date/due_time/due_datetime、status，从不写回 Productivity OS 的
+ * 表），不知道会议、日历、忙闲状态。
+ *
+ * 不依赖 12_TemporalEngine.gs——offset 是"到期时间减一个量"的简单减法，
+ * 不是 recurrence 计算，ADR-004 已经明确排除"提前N天/N小时提醒"这类逻辑
+ * 属于 Temporal Engine 的范围（design doc §0）。
+ *
+ * 🔧 实现阶段发现的设计细化（相对 design doc §3 的偏离，写代码时才看得
+ * 出来，纸面设计阶段看不出来，所以记在这里而不是回去默默改设计文档）：
+ *
+ * 1. 去掉了 occurrence_id，ReminderOccurrences 和 ReminderHistory 都
+ *    直接用 idempotency_key 当主键——idempotency_key（rule_id+channel+
+ *    到分钟精度的 fire_at）天然唯一，多一个 occurrence_id 是冗余的第二套
+ *    身份。
+ *
+ * 2. design doc §3 原来说"判重要同时查 Occurrences 和 History"——写代码
+ *    时发现这行不通：21_SheetUtils.gs 的 batchReadFieldsByKey_ 即使是
+ *    "定点查询"，读取量依然正比于目标表的【总行数】（它自己文件头写明：
+ *    "这一步的读取量仍然正比于 sheetName 的总行数"），不是正比于要查的
+ *    key 数量。ReminderHistory 设计上就是无限增长的表，如果每一轮 poll
+ *    都去查它的 key 列，等于重新制造一次 HIGH RISK 2（Tasks 表那次）已经
+ *    修过的同一类问题，只是换了张表、换了个引擎。
+ *
+ *    改法：ReminderRules 新增 resolved_fire_ats 字段（JSON，
+ *    {channel: 上一次为这个 channel 解决掉的 fire_at}）。判断"这个
+ *    (rule, channel, fire_at) 还要不要处理"只需要拿这一轮已经读进内存的
+ *    rule 对象比一下时间戳，不需要多查任何表。History 因此变成纯只写——
+ *    poll 的热路径完全不读它，不管它长多大都不影响每一轮的读取成本，比
+ *    design doc 原方案更彻底地满足了 §3 本来就想要的"Hot Table 有界"。
+ *
+ *    ReminderOccurrences 仍然会被查（判断"这个 fire_at 是不是已经有一条
+ *    正在处理中/等重试的 in-flight 记录"），但这张表本身有界（非终态才
+ *    留在这里），查它没有 History 那个问题。
+ *
+ * 依赖假设（design doc §2 Open Item 1，尚未拿到 Productivity OS 代码
+ * 验证）：_resolveEffectiveDueDatetime_ 把"读哪个到期字段"收在一个函数
+ * 里，due_datetime/due_date+due_time/纯 due_date 三种可能都试一遍，
+ * schema 一旦确认，只需要改这一个函数。
+ */
+
+var ReminderOffsetEngine = (function () {
+
+  // ---------- Config（Constitution P8：能用命名常量就不建 SecureConfig；
+  // design doc §3 决策）----------
+
+  var RULES_SHEET = 'ReminderRules';
+  var OCCURRENCES_SHEET = 'ReminderOccurrences';
+  var HISTORY_SHEET = 'ReminderHistory';
+
+  // design doc §3：默认规则 offset（分钟），-1天/-1小时/-15分钟（你原始
+  // 例子）。空数组 = 关闭自动生成默认规则，同一个配置项兼作开关，不另加
+  // 布尔标志。
+  var DEFAULT_REMINDER_OFFSETS_MINUTES = [1440, 60, 15];
+
+  // design doc §5：Quiet Hours，24小时制本地时间。两者都是 null 表示关闭
+  // （跟上面同一个"哨兵值当开关"的约定）。按 disposition 决定，V1 暂不
+  // 启用——等真实使用经验，不是现在猜（见 Constitution 相关讨论）。
+  var QUIET_HOURS_START_HOUR = null;
+  var QUIET_HOURS_END_HOUR = null;
+
+  var LOCK_WAIT_MS = 10000;
+  var HARD_EXECUTION_LIMIT_MS = 6 * 60 * 1000;
+  // 比 25_ReminderEngine.gs 的 WORST_CASE_SINGLE_TASK_MS 略保守：一条
+  // rule 可能对应多个 channel，循环体比"一个 task"更重一点。
+  var WORST_CASE_SINGLE_RULE_MS = 3000;
+  var EXTRA_SAFETY_MARGIN_MS = 15000;
+  var EXECUTION_TIME_BUDGET_MS = HARD_EXECUTION_LIMIT_MS - WORST_CASE_SINGLE_RULE_MS - EXTRA_SAFETY_MARGIN_MS;
+
+  // 沿用 25_ReminderEngine.gs 同款折中，完整理由见那边文件头。
+  var BATCH_WRITE_CHUNK_SIZE = 5;
+  var MAX_RETRY_ATTEMPTS = 2;
+  var RETRY_DELAY_MINUTES = 5;
+  // key 名字换成这个引擎自己的前缀，避免跟 25_ReminderEngine.gs 抢同一个
+  // PropertiesService key。
+  var RETRY_FLAG_KEY = 'REMINDER_OFFSET_ENGINE_RETRY_TRIGGER_ID';
+  var RETRY_COUNT_KEY = 'REMINDER_OFFSET_ENGINE_RETRY_COUNT';
+
+  // ---------- Identity（跟 20_EventBus.gs 同一套 PREFIX-timestamp-random
+  // 惯例，见 Constitution/design doc §10 Identity）----------
+
+  function _generateRuleId_() {
+    return 'RULE-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+  }
+
+  // ---------- 到期时间解析 ----------
+
+  function _resolveEffectiveDueDatetime_(task) {
+    if (task.due_datetime) {
+      var dt1 = SheetUtils.parseDueDate_(task.due_datetime);
+      if (dt1) return dt1;
+    }
+    if (task.due_date && task.due_time) {
+      var combined = String(task.due_date).trim() + 'T' + String(task.due_time).trim();
+      var dt2 = new Date(combined);
+      if (!isNaN(dt2.getTime())) return dt2;
+    }
+    if (task.due_date) {
+      var dt3 = SheetUtils.parseDueDate_(task.due_date);
+      if (dt3) return dt3;
+    }
+    return null; // 没有可用的到期时间信息，这个 task 这一轮不参与 offset 计算
+  }
+
+  function _parseJsonSafe_(str, fallback) {
+    if (!str) return fallback;
+    try {
+      var parsed = JSON.parse(str);
+      return parsed || fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function _computeIdempotencyKey_(ruleId, channel, fireAt) {
+    return ruleId + ':' + channel + ':' + Math.floor(fireAt.getTime() / 60000);
+  }
+
+  /**
+   * design doc §5 Quiet Hours：固定时钟窗口，不读日历、不判断"此刻是否
+   * 有会议"——跟 availability analysis 的区别见 Constitution P9。
+   */
+  function _isWithinQuietHours_(now) {
+    if (QUIET_HOURS_START_HOUR === null || QUIET_HOURS_END_HOUR === null) return false;
+    var hour = now.getHours();
+    if (QUIET_HOURS_START_HOUR <= QUIET_HOURS_END_HOUR) {
+      return hour >= QUIET_HOURS_START_HOUR && hour < QUIET_HOURS_END_HOUR;
+    }
+    return hour >= QUIET_HOURS_START_HOUR || hour < QUIET_HOURS_END_HOUR; // 跨午夜窗口，如 22→8
+  }
+
+  function _offsetLabel_(minutes) {
+    if (minutes >= 1440 && minutes % 1440 === 0) return (minutes / 1440) + ' day(s) before';
+    if (minutes >= 60 && minutes % 60 === 0) return (minutes / 60) + ' hour(s) before';
+    return minutes + ' minute(s) before';
+  }
+
+  // ---------- Default rule generation（design doc §10 Request）----------
+
+  function _ensureDefaultRules_(pendingTasks, taskIdsWithRules) {
+    if (!DEFAULT_REMINDER_OFFSETS_MINUTES || DEFAULT_REMINDER_OFFSETS_MINUTES.length === 0) {
+      return []; // 关闭
+    }
+    var newRules = [];
+    for (var i = 0; i < pendingTasks.length; i++) {
+      var task = pendingTasks[i];
+      if (taskIdsWithRules[task.task_id]) continue;
+      var effectiveDue = _resolveEffectiveDueDatetime_(task);
+      if (!effectiveDue) continue; // 没有可用到期时间，不生成默认规则
+
+      for (var j = 0; j < DEFAULT_REMINDER_OFFSETS_MINUTES.length; j++) {
+        var offsetMinutes = DEFAULT_REMINDER_OFFSETS_MINUTES[j];
+        newRules.push({
+          rule_id: _generateRuleId_(),
+          task_id: task.task_id,
+          chat_id: task.chat_id,
+          offset_minutes: offsetMinutes,
+          offset_label: _offsetLabel_(offsetMinutes),
+          channels: JSON.stringify(['telegram']),
+          rule_status: 'active',
+          source: 'auto_default',
+          resolved_fire_ats: JSON.stringify({}),
+          created_at: new Date().toISOString()
+        });
+      }
+      taskIdsWithRules[task.task_id] = true; // 避免同一轮内对同一个 task 重复生成
+    }
+    return newRules;
+  }
+
+  // ---------- Message / keyboard ----------
+  // 复用 25_ReminderEngine.gs 现有的 callback_data 惯例
+  // （task_done:/task_snooze:，只认 task_id）。多个 occurrence 共用同一对
+  // 按钮时 Snooze 语义仍然模糊，这是 design doc §2 记录过的已知开放项，
+  // 跨项目协调（Personal AI Core 的 webhook 解析）超出这个文件的范围，
+  // 不在这里解决。
+
+  function _formatMessage_(rule, task, effectiveDue) {
+    return '⏰ 提醒（' + rule.offset_label + '）\n' +
+      (task.title || task.task_id) + '\n' +
+      '到期: ' + effectiveDue.toLocaleString();
+  }
+
+  function _buildKeyboard_(task) {
+    return {
+      inline_keyboard: [[
+        { text: '✅ Done', callback_data: 'task_done:' + task.task_id },
+        { text: '⏰ Snooze 1h', callback_data: 'task_snooze:' + task.task_id }
+      ]]
+    };
+  }
+
+  function _toHistoryRecord_(occurrence, finalStatus, reason) {
+    return {
+      idempotency_key: occurrence.idempotency_key,
+      rule_id: occurrence.rule_id,
+      task_id: occurrence.task_id,
+      chat_id: occurrence.chat_id,
+      channel: occurrence.channel,
+      computed_fire_at: occurrence.computed_fire_at,
+      final_status: finalStatus,
+      attempt_count: occurrence.attempt_count || 0,
+      resolved_at: new Date().toISOString(),
+      resolved_reason: reason,
+      archived_at: new Date().toISOString()
+    };
+  }
+
+  function _reminderEvent_(type, occurrence, reason) {
+    return {
+      type: type,
+      chat_id: occurrence.chat_id,
+      payload: JSON.stringify({
+        rule_id: occurrence.rule_id,
+        task_id: occurrence.task_id,
+        idempotency_key: occurrence.idempotency_key,
+        channel: occurrence.channel,
+        reason: reason
+      }),
+      source: 'ReminderOffsetEngine'
+    };
+  }
+
+  // ---------- Persistence batching ----------
+  // 沿用 25_ReminderEngine.gs 的顺序原则：先功能性状态、再审计事件；这里
+  // 额外多一层顺序（design doc §3 归档机制）：History 先写成功，才删
+  // Occurrences——中途失败最坏结果是"两边都有"，不会是"两边都没有"。
+
+  function _persistBatch_(occurrenceUpserts, historyInserts, occurrenceDeleteKeys, ruleUpdates, ruleDeleteIds) {
+    if (historyInserts && historyInserts.length > 0) {
+      try {
+        SheetUtils.batchUpsertRowsByKey_(HISTORY_SHEET, 'idempotency_key', historyInserts);
+      } catch (e) {
+        Logger.log('[ReminderOffsetEngine] ❌ History 批量写入失败，本批不会从 Occurrences 删除' +
+          '（避免记录丢失），下一轮会重新尝试归档: ' + e.message);
+        historyInserts = [];
+        occurrenceDeleteKeys = []; // History 没写成功，不能删 Occurrences，宁可重复尝试也不丢记录
+      }
+    }
+    if (occurrenceDeleteKeys && occurrenceDeleteKeys.length > 0) {
+      occurrenceDeleteKeys.forEach(function (key) {
+        try {
+          SheetUtils.deleteRowByKey_(OCCURRENCES_SHEET, 'idempotency_key', key);
+        } catch (e) {
+          Logger.log('[ReminderOffsetEngine] ⚠️ 从 Occurrences 删除 ' + key + ' 失败: ' + e.message);
+        }
+      });
+    }
+    if (occurrenceUpserts && occurrenceUpserts.length > 0) {
+      try {
+        SheetUtils.batchUpsertRowsByKey_(OCCURRENCES_SHEET, 'idempotency_key', occurrenceUpserts);
+      } catch (e) {
+        Logger.log('[ReminderOffsetEngine] ❌ Occurrences 批量写入失败: ' + e.message);
+      }
+    }
+    if (ruleUpdates && ruleUpdates.length > 0) {
+      try {
+        SheetUtils.batchUpdateFieldsByKey_(RULES_SHEET, 'rule_id', ruleUpdates);
+      } catch (e) {
+        Logger.log('[ReminderOffsetEngine] ❌ Rules 状态更新失败: ' + e.message);
+      }
+    }
+    if (ruleDeleteIds && ruleDeleteIds.length > 0) {
+      ruleDeleteIds.forEach(function (id) {
+        try {
+          SheetUtils.deleteRowByKey_(RULES_SHEET, 'rule_id', id);
+        } catch (e) {
+          Logger.log('[ReminderOffsetEngine] ⚠️ 退休规则 ' + id + ' 删除失败: ' + e.message);
+        }
+      });
+    }
+  }
+
+  function _publishPendingEvents_(events) {
+    if (!events || events.length === 0) return;
+    try {
+      EventBus.publishBatch(events);
+    } catch (e) {
+      Logger.log('[ReminderOffsetEngine] ⚠️ Events 审计记录失败（不影响已经落盘的功能性状态）: ' + e.message);
+    }
+  }
+
+  // ---------- Retry / lock ----------
+  // 跟 25_ReminderEngine.gs 同款模式，key 名字换成这个引擎自己的前缀。
+
+  function _cleanupStaleRetryTrigger_() {
+    var props = PropertiesService.getScriptProperties();
+    var triggerId = props.getProperty(RETRY_FLAG_KEY);
+    if (!triggerId) return;
+    try {
+      var triggers = ScriptApp.getProjectTriggers();
+      for (var i = 0; i < triggers.length; i++) {
+        if (triggers[i].getUniqueId() === triggerId) {
+          ScriptApp.deleteTrigger(triggers[i]);
+          break;
+        }
+      }
+    } catch (e) {
+      Logger.log('[ReminderOffsetEngine] 清理重试 trigger 出错（忽略）: ' + e.message);
+    }
+    props.deleteProperty(RETRY_FLAG_KEY);
+  }
+
+  function _scheduleRetry_() {
+    var props = PropertiesService.getScriptProperties();
+    var attemptCount = Number(props.getProperty(RETRY_COUNT_KEY) || '0');
+    if (attemptCount >= MAX_RETRY_ATTEMPTS) {
+      props.deleteProperty(RETRY_COUNT_KEY);
+      return;
+    }
+    var trigger = ScriptApp.newTrigger('checkOffsetReminders')
+      .timeBased()
+      .after(RETRY_DELAY_MINUTES * 60 * 1000)
+      .create();
+    props.setProperty(RETRY_FLAG_KEY, trigger.getUniqueId());
+    props.setProperty(RETRY_COUNT_KEY, String(attemptCount + 1));
+  }
+
+  function _readAllRows_(sheetName) {
+    // ReminderRules/ReminderOccurrences 设计上都是有界表（design doc §3），
+    // 整表读符合 22_QueryEngine.gs 读 ActiveTasks 同一个"有界表可以整表读"
+    // 的既有惯例，不是新引入的模式。
+    var sheet = SheetUtils.getSheet_(sheetName);
+    var headerMap = SheetUtils.getHeaderMap_(sheet);
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return [];
+    var numCols = sheet.getLastColumn();
+    var values = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+    var headers = Object.keys(headerMap);
+    return values.map(function (row) {
+      var obj = {};
+      headers.forEach(function (h) { obj[h] = row[headerMap[h]]; });
+      return obj;
+    });
+  }
+
+  // ---------- 主流程（design doc §5，含 resolved_fire_ats 细化）----------
+
+  function checkOffsetReminders() {
+    _cleanupStaleRetryTrigger_();
+
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(LOCK_WAIT_MS);
+    } catch (e) {
+      Logger.log('[ReminderOffsetEngine] 前序执行尚未结束，跳过本次，安排重试');
+      _scheduleRetry_();
+      return { rulesChecked: 0, sent: 0, cancelled: 0, failed: 0, defaultRulesCreated: 0 };
+    }
+
+    PropertiesService.getScriptProperties().deleteProperty(RETRY_COUNT_KEY);
+
+    var startedAt = Date.now();
+    var stats = { rulesChecked: 0, sent: 0, cancelled: 0, failed: 0, defaultRulesCreated: 0 };
+
+    try {
+      var allRules = _readAllRows_(RULES_SHEET);
+      var activeRules = [];
+      var staleRuleIds = [];
+      var taskIdsWithRules = {};
+      for (var r = 0; r < allRules.length; r++) {
+        var ruleRow = allRules[r];
+        taskIdsWithRules[ruleRow.task_id] = true;
+        if (ruleRow.rule_status === 'active') {
+          activeRules.push(ruleRow);
+        } else {
+          staleRuleIds.push(ruleRow.rule_id); // 人工改过状态但还没被删掉的行，一并清理
+        }
+      }
+
+      var pendingTasks = QueryEngine.getPendingTasks();
+      var pendingTaskById = {};
+      pendingTasks.forEach(function (t) { pendingTaskById[t.task_id] = t; });
+
+      var newDefaultRules = _ensureDefaultRules_(pendingTasks, taskIdsWithRules);
+      if (newDefaultRules.length > 0) {
+        SheetUtils.batchUpsertRowsByKey_(RULES_SHEET, 'rule_id', newDefaultRules);
+        activeRules = activeRules.concat(newDefaultRules);
+        stats.defaultRulesCreated = newDefaultRules.length;
+      }
+
+      // Occurrences 有界，整表读没问题（跟上面 Rules 同理）
+      var occurrenceByKey = {};
+      _readAllRows_(OCCURRENCES_SHEET).forEach(function (o) { occurrenceByKey[o.idempotency_key] = o; });
+
+      var occUpserts = [];
+      var historyInserts = [];
+      var occDeletes = [];
+      var pendingEvents = [];
+      var ruleUpdates = [];
+
+      function flush() {
+        _persistBatch_(occUpserts, historyInserts, occDeletes, ruleUpdates, []);
+        _publishPendingEvents_(pendingEvents);
+        occUpserts = []; historyInserts = []; occDeletes = []; ruleUpdates = []; pendingEvents = [];
+      }
+      function flushIfNeeded() {
+        if (occUpserts.length + historyInserts.length + occDeletes.length + ruleUpdates.length >= BATCH_WRITE_CHUNK_SIZE) {
+          flush();
+        }
+      }
+
+      for (var i = 0; i < activeRules.length; i++) {
+        if (Date.now() - startedAt > EXECUTION_TIME_BUDGET_MS) {
+          Logger.log('[ReminderOffsetEngine] 时间预算耗尽，剩余规则留给下次触发器');
+          break;
+        }
+        var rule = activeRules[i];
+        stats.rulesChecked++;
+        var task = pendingTaskById[rule.task_id];
+
+        if (!task) {
+          // design doc §5 step 4：task 不在这一轮的 pending 集合里 → 取消
+          for (var key in occurrenceByKey) {
+            var occ = occurrenceByKey[key];
+            if (occ.rule_id === rule.rule_id &&
+              (occ.status === 'pending' || occ.status === 'failed' || occ.status === 'snoozed')) {
+              historyInserts.push(_toHistoryRecord_(occ, 'cancelled', 'task_no_longer_pending'));
+              occDeletes.push(occ.idempotency_key);
+              pendingEvents.push(_reminderEvent_('REMINDER_CANCELLED', occ, 'task_no_longer_pending'));
+              stats.cancelled++;
+            }
+          }
+          staleRuleIds.push(rule.rule_id);
+          flushIfNeeded();
+          continue;
+        }
+
+        var effectiveDue = _resolveEffectiveDueDatetime_(task);
+        if (!effectiveDue) continue;
+
+        var channels = _parseJsonSafe_(rule.channels, ['telegram']);
+        var resolvedFireAts = _parseJsonSafe_(rule.resolved_fire_ats, {});
+        var ruleResolvedChanged = false;
+
+        for (var c = 0; c < channels.length; c++) {
+          var channel = channels[c];
+          var fireAt = new Date(effectiveDue.getTime() - rule.offset_minutes * 60000);
+
+          // 🔧 实现阶段细化：不查 History，查 rule 自带的 resolved_fire_ats
+          // （文件头有完整说明）。
+          var lastResolved = resolvedFireAts[channel] ? new Date(resolvedFireAts[channel]) : null;
+          if (lastResolved && fireAt.getTime() <= lastResolved.getTime()) continue;
+          if (fireAt.getTime() > Date.now()) continue; // 还没到时间
+
+          var idempotencyKey = _computeIdempotencyKey_(rule.rule_id, channel, fireAt);
+          var occurrence = occurrenceByKey[idempotencyKey];
+          if (!occurrence) {
+            occurrence = {
+              idempotency_key: idempotencyKey,
+              rule_id: rule.rule_id,
+              task_id: rule.task_id,
+              chat_id: rule.chat_id,
+              channel: channel,
+              computed_fire_at: fireAt.toISOString(),
+              status: 'pending',
+              attempt_count: 0,
+              last_attempt_at: '',
+              snoozed_until: ''
+            };
+            occurrenceByKey[idempotencyKey] = occurrence;
+          }
+
+          if (occurrence.status === 'snoozed') continue; // 预留状态，V1 没有代码路径会产生它
+
+          if (_isWithinQuietHours_(new Date())) {
+            occUpserts.push(occurrence); // 物化但不发送，留到下一轮 Quiet Hours 结束后
+            flushIfNeeded();
+            continue;
+          }
+
+          var sendResult = Output.send(channel, rule.chat_id, _formatMessage_(rule, task, effectiveDue), {
+            keyboard: _buildKeyboard_(task)
+          });
+          occurrence.attempt_count = (occurrence.attempt_count || 0) + 1;
+          occurrence.last_attempt_at = new Date().toISOString();
+
+          if (sendResult && sendResult.ok) {
+            historyInserts.push(_toHistoryRecord_(occurrence, 'sent', 'delivered'));
+            occDeletes.push(idempotencyKey);
+            pendingEvents.push(_reminderEvent_('REMINDER_SENT', occurrence, 'delivered'));
+            resolvedFireAts[channel] = fireAt.toISOString();
+            ruleResolvedChanged = true;
+            stats.sent++;
+          } else if (occurrence.attempt_count >= MAX_RETRY_ATTEMPTS) {
+            historyInserts.push(_toHistoryRecord_(occurrence, 'failed', (sendResult && sendResult.error) || 'unknown'));
+            occDeletes.push(idempotencyKey);
+            pendingEvents.push(_reminderEvent_('REMINDER_FAILED', occurrence, (sendResult && sendResult.error) || 'unknown'));
+            resolvedFireAts[channel] = fireAt.toISOString();
+            ruleResolvedChanged = true;
+            stats.failed++;
+          } else {
+            occurrence.status = 'failed'; // 还在重试预算内，留到下一轮再试
+            occUpserts.push(occurrence);
+          }
+
+          flushIfNeeded();
+        }
+
+        if (ruleResolvedChanged) {
+          ruleUpdates.push({ rule_id: rule.rule_id, resolved_fire_ats: JSON.stringify(resolvedFireAts) });
+        }
+      }
+
+      flush();
+      if (staleRuleIds.length > 0) {
+        staleRuleIds.forEach(function (id) {
+          try { SheetUtils.deleteRowByKey_(RULES_SHEET, 'rule_id', id); } catch (e) { /* 见 _persistBatch_ 同款容错 */ }
+        });
+      }
+
+      return stats;
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  return {
+    checkOffsetReminders: checkOffsetReminders,
+    // 以下几个仅为单元测试暴露，不是给其他文件调用的公开 API
+    _resolveEffectiveDueDatetime_: _resolveEffectiveDueDatetime_,
+    _computeIdempotencyKey_: _computeIdempotencyKey_,
+    _isWithinQuietHours_: _isWithinQuietHours_,
+    _offsetLabel_: _offsetLabel_,
+    _ensureDefaultRules_: _ensureDefaultRules_
+  };
+})();
+
+/**
+ * 顶层 trigger 绑定函数——GAS 的 time-based trigger 只能绑定全局函数名，
+ * 不能绑定 IIFE 内部方法，镜像 25_ReminderEngine.gs 的 checkReminders()
+ * 同款薄转发模式（design doc §10 file map）。
+ */
+function checkOffsetReminders() {
+  return ReminderOffsetEngine.checkOffsetReminders();
+}

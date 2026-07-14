@@ -113,6 +113,7 @@ Your hard requirement — *"never require users to manually edit reminder timest
 | `channels` | JSON array, e.g. `["telegram"]` |
 | `rule_status` | `active` \| `task_completed` \| `task_deleted` \| `removed` |
 | `source` | `auto_default` \| `manual` — distinguishes an auto-generated rule from a hand-edited one |
+| `resolved_fire_ats` | *(added during implementation, see archival note below)* JSON, `{channel: last-resolved fire_at}` — replaces the "check History" idempotency approach |
 | `created_at` | |
 
 ### `ReminderOccurrences` (scheduled instance — HOT, BOUNDED, non-terminal states only)
@@ -121,10 +122,9 @@ Now genuinely bounded, not just targeted-read-bounded: a row lives here only whi
 
 | Column | Notes |
 |---|---|
-| `occurrence_id` | PK — carries forward unchanged into `ReminderHistory` on archive |
+| `idempotency_key` | PK — `rule_id + ':' + channel + ':' + floor(computed_fire_at / 60000)`. *(Implementation note: this replaces a separate `occurrence_id`; the key was already a perfectly good unique identity on its own.)* |
 | `rule_id`, `task_id`, `chat_id`, `channel` | as before |
 | `computed_fire_at` | due-datetime snapshot this occurrence was computed against, minute precision |
-| `idempotency_key` | `rule_id + ':' + channel + ':' + floor(computed_fire_at / 60000)` |
 | `status` | `pending` \| `snoozed` *(reserved)* \| `failed` — only non-terminal values live here at rest |
 | `attempt_count`, `last_attempt_at` | retry tracking |
 | `snoozed_until` | *(reserved, nullable, always null in V1)* — see below |
@@ -133,14 +133,16 @@ Now genuinely bounded, not just targeted-read-bounded: a row lives here only whi
 
 | Column | Notes |
 |---|---|
-| `occurrence_id` | PK, identity carried over from `ReminderOccurrences` — not a new ID scheme |
+| `idempotency_key` | PK, identity carried over from `ReminderOccurrences` unchanged |
 | `rule_id`, `task_id`, `chat_id`, `channel`, `computed_fire_at` | copied at archive time |
 | `final_status` | `sent` \| `dismissed` \| `cancelled` \| `failed` |
 | `attempt_count` | final count at resolution |
 | `resolved_at`, `resolved_reason` | |
 | `archived_at` | |
 
-**Archival mechanism, and the one real cost this split adds:** when an occurrence resolves, write it into `ReminderHistory` first (`batchUpsertRowsByKey_`, keyed by `occurrence_id` — safely re-runnable if the process dies mid-flush), then delete it from `ReminderOccurrences` (`deleteRowByKey_`). History-first ordering means a crash between the two steps leaves a harmless temporary duplicate rather than a lost record. The idempotency check that decides "should a new occurrence be created for this key" now has to check **both** tables — `ReminderOccurrences` for anything in flight, `ReminderHistory` for anything already resolved — since a resolved-and-archived row no longer lives in the one table that used to hold everything. Flagging this plainly as the real cost of the three-table split versus the original design: one idempotency check became two lookups. Both are still targeted key lookups, not scans, so the cost is negligible — but it isn't free, and it's worth saying so rather than letting the split look like it came at no price.
+**Archival mechanism — revised during implementation (see `26_ReminderOffsetEngine.gs` header for the full reasoning).** Writing the actual code surfaced a real problem with the plan above: `SheetUtils.batchReadFieldsByKey_`'s own documentation states its read cost is proportional to the **target sheet's total row count**, not the number of keys being looked up — so "check `ReminderHistory` for this key" would scale with History's size, reintroducing the exact shape of `HIGH RISK 2` on a new table. Fix: dropped the separate `occurrence_id` (the `idempotency_key` was already a perfectly good unique identity — one less generated ID to track), and added `resolved_fire_ats` to `ReminderRules` (JSON, `{channel: last-resolved fire_at}`). The idempotency check now compares against this field on the rule object already sitting in memory from this poll's rule read — zero additional Sheet reads, and **`ReminderHistory` is never read during normal operation**, only ever written to. This is a strictly stronger version of the bounded-hot-path property §3 already wanted, discovered by actually building it rather than by re-reading the design on paper.
+
+`ReminderOccurrences` is still checked before creating a new row (catches anything still in-flight from a previous poll) — that check stays cheap because `ReminderOccurrences` itself is bounded, unlike `ReminderHistory`.
 
 **SNOOZED — reserved, not implemented (your point 4).** Added `snoozed` to the status enum plus a companion `snoozed_until` field — a status alone can't represent "snoozed until when," so reserving the field alongside it is what makes the reservation actually usable later without a schema migration. Intended future semantics: `pending → snoozed` on a user action (a future third button, not V1's current Done/Snooze-1h pair), `snoozed → pending` once `snoozed_until` elapses. Nothing in this design currently writes or reads either — flagging that I've extended your ask slightly (the field, not just the enum value) since the status alone isn't meaningful without it; happy to strip the field back out if you'd rather reserve only the label.
 
