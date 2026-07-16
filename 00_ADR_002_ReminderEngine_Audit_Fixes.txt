@@ -5,9 +5,11 @@
  * STATUS: Accepted
  * DATE: 2026-07-06（第一轮），后续追加审计/后续解决的核实+修复过程
  * 直接续在同一份 ADR 里（第二轮/第三轮同为 2026-07-06，第四轮
- * 2026-07-10，第三轮 HIGH RISK 2 后续解决 2026-07-11）——都是同一份
- * 审计对象（ReminderEngine 及其直接依赖）的持续复审/延续解决，不是
- * 独立决策，没有必要拆成 ADR-002a/002b/002c/002d/002e 各自维护。
+ * 2026-07-10，第三轮 HIGH RISK 2 后续解决 2026-07-11，第五轮
+ * 2026-07-15）——都是同一份审计对象（ReminderEngine 及其直接依赖，
+ * 第五轮起自然延伸到同一脉络的 ReminderOffsetEngine）的持续复审/延续
+ * 解决，不是独立决策，没有必要拆成 ADR-002a/002b/002c/002d/002e/002f
+ * 各自维护。
  */
 
 /**
@@ -808,4 +810,284 @@
  *   reminder_count_total 可能从未被真实触发过），记录在
  *   00_Project_State.gs「已知问题」，留给 Carson 判断是否需要在
  *   Productivity OS 那边跟进。
+ *
+ *
+ * ══════════════════════════════════════════════════════════════
+ * 第五轮外部审计（2026-07-15）+ 同日 GAS Console 实测问题
+ * ══════════════════════════════════════════════════════════════
+ *
+ * 背景：第四轮（2026-07-10）+ 第三轮 HIGH RISK 2 后续解决（2026-07-11）
+ * 之后，到这次审计（2026-07-15）之间，项目发生了两件不在本 ADR 记录范围
+ * 内、但读者需要知道存在的事：① 新增了完整的 Offset Reminder Engine
+ * （2_Runtime/26_ReminderOffsetEngine.gs + 5_Testing/
+ * 50_ReminderOffsetEngine_Tests.gs），经过多轮设计精化，引入了 Project
+ * Constitution P8/P9 两条新原则；② 对 1_Foundation/12_TemporalEngine.gs
+ * 做了一次独立的 UEF 架构评审（2026-07-12），4条 LOW 发现里3条
+ * （Finding 1/2/4）在2026-07-13被修复，第4条（Finding 3，Object.freeze）
+ * 当时 disposition 是 Fix Later，本轮审计重新独立发现了同一个问题（见下
+ * LOW RISK 1），予以采纳、提升为 Fix Now，完整过程见
+ * 00_ADR_004_Temporal_Engine_Design.gs「2026-07-15 修订记录」。这两件事
+ * 本身都没有被追加进本 ADR 或 00_Project_State.gs/00_File_Map.gs——这是
+ * 一处已知的文档缺口，本轮修复顺手发现但没有回填，见 00_Project_State.gs
+ * 本轮条目末尾和本节末尾的说明。
+ *
+ * 第五轮审计报告本身覆盖 20_EventBus.gs/21_SheetUtils.gs/
+ * 25_ReminderEngine.gs/26_ReminderOffsetEngine.gs/12_TemporalEngine.gs
+ * 共4个 HIGH + 1个 MEDIUM + 1个 LOW，要求按严重程度顺序全部修复。
+ *
+ * === 逐条核实 + 处理 ===
+ *
+ * HIGH RISK 1（26_ReminderOffsetEngine.gs checkOffsetReminders，幂等
+ * 判断在到期时间改早时误判为"已处理"）
+ *   核实：属实。resolved_fire_ats 原本按 channel 存"上一次为这个
+ *   channel 算出的 fireAt"，判重逻辑是
+ *   fireAt.getTime() <= lastResolved.getTime() 就跳过——这个单向比较
+ *   隐含"同一个 channel 再次算出的 fireAt 只会不变或变大"，只在"任务
+ *   到期时间不变或后移"时成立。用户把一个已经解决过的、还在 pending 的
+ *   任务的到期时间改早，重新算出的 fireAt 会跟着变小，反而满足"<=上次"，
+ *   被误判成已处理而跳过，用户收不到新到期时间对应的提醒。
+ *   修复：resolved_fire_ats 每个 channel 存的值，语义改成"上次解决这个
+ *   channel 时，effectiveDue（任务到期时间）是多少"，判重逻辑改成直接
+ *   比对 effectiveDue 是否等于上次记录的值——到期时间没变就不重复处理，
+ *   变了（不管改早还是改晚）都判定需要重新评估，交给 fireAt 相关的时间
+ *   判断决定现在要不要真的发送。字段名（resolved_fire_ats）本身没有改，
+ *   只改存的值和比较方式——改列名是数据迁移级别的变动，不是这次修复的
+ *   必要部分。
+ *
+ * HIGH RISK 2（20_EventBus.gs publishBatch，"先读行数再写入"两步非
+ * 原子，三个独立项目共享 Events 表时可能互相覆盖）
+ *   核实：属实。publishBatch 用 sheet.getLastRow()+1 算起始行、一次
+ *   setValues() 写连续多行——Reminder OS/Personal AI Core/
+ *   Productivity OS 三个独立 Apps Script 项目共享同一张 Events 表，
+ *   任何一个项目在这两步之间插入自己的写入，都会让本次算出的起始行
+ *   过期，后写入的这一批把那次并发写入的内容覆盖掉。
+ *   修复：改成逐行调用 appendRow()——GAS 官方文档明确 appendRow 是
+ *   原子操作（"prevents issues where a user asks for the last row, and
+ *   then writes to that row, and an intervening mutation occurs"），
+ *   服务端在处理这次调用的当下才决定"当前实际的最后一行是哪一行"，不
+ *   依赖调用方之前缓存的行号，天然避免这种竞态。本文件的单条 publish()
+ *   一直用的就是 appendRow，历次审计都没有点名过这个问题，是同一个
+ *   平台保证在起作用，间接印证了这个修法的方向。代价：从"1次
+ *   setValues() 写N行"退化成"最多N次 appendRow() 各写1行"——两个调用方
+ *   的批量节奏都是 BATCH_WRITE_CHUNK_SIZE=5，单次 flush 最多5次同步
+ *   调用，拿这点可接受的性能回退换掉数据丢失风险。
+ *   ⚠️ 范围边界：这只保证 Reminder OS 自己这一侧的写入不再因为"读跟写
+ *   不是原子的一步"而丢数据；如果 Personal AI Core / Productivity OS
+ *   各自的 EventBus 副本内部也用类似 getLastRow()+setValues() 的写法，
+ *   那两个项目自己的这条线仍然需要各自去修，本项目看不到那两个项目的
+ *   代码，也没有办法替它们改。
+ *
+ * HIGH RISK 3（21_SheetUtils.gs batchReadFieldsByKey_，逐格
+ * getValue() 反模式）
+ *   核实：属实。命中的每个 key、要读的每个字段都各自单独调一次
+ *   sheet.getRange(rowNum, col).getValue()，同步网络调用次数是命中数×
+ *   字段数的乘积。
+ *   修复：先算出命中的所有行号、要读的所有列号各自的 [min,max] 包络，
+ *   一次 getValues() 把这个矩形区域整体读进内存（代价是可能顺带读到
+ *   命中key之间、字段之间用不上的行/列，但比起"每个单元格各一次调用"，
+ *   用一次范围读换掉 O(N) 次调用远远划算），再在内存里按偏移量取值。
+ *   I/O 调用次数从"命中数×字段数"降到最多2次（定位行号1次+整块取值
+ *   1次）。这个函数之前没有专属测试覆盖过（22_QueryEngine.gs 是唯一
+ *   调用方，但 mocks.js 对 QueryEngine 用的是简化 mock，没有真的走到
+ *   这个函数），借这次修复顺手新增 5_Testing/50_SheetUtils_Tests.gs
+ *   补上（范围只覆盖这次改到的三个函数，不是 SheetUtils 全量覆盖，见
+ *   该文件文件头）。
+ *
+ * HIGH RISK 4（25_ReminderEngine.gs checkReminders /
+ * 26_ReminderOffsetEngine.gs checkOffsetReminders，LockService 不能
+ * 跨 standalone 项目生效）
+ *   核实：属实。两个引擎都用 LockService.getScriptLock() 提供互斥
+ *   保障，但 Script Lock 只在当前脚本项目内部起作用，无法阻止 Personal
+ *   AI Core（处理 Telegram 按钮回调）或 Productivity OS 在本项目执行
+ *   期间并发写共享的 Tasks/ReminderRules/Events 等表。
+ *   评估审计给的两条修法，都没有采纳：
+ *     1. 在共享 Spreadsheet 里建一张专属锁定表，各项目写入前互相
+ *        协调——需要 Personal AI Core 和 Productivity OS 也同步实现
+ *        并遵守同一套协议，本项目单方面加锁对那两个项目的写入没有任何
+ *        约束力，等于只加复杂度不加保护，是虚假的安全感。本项目这次
+ *        也看不到那两个项目的代码，没有办法替它们改，也没法验证它们
+ *        是否会配合。
+ *     2. 把三个项目都迁移成绑定在同一 Spreadsheet 下的容器绑定脚本，
+ *        以启用 LockService.getDocumentLock()——这是牵动全平台三个
+ *        项目的部署架构变动，不是能在 Reminder OS 这一个项目里单方面
+ *        决定的事。
+ *   没有在代码层面"修复"，只在两处加锁点（checkReminders/
+ *   checkOffsetReminders）补充了详细注释说明这个评估过程。跟 MEDIUM
+ *   RISK 1（第四轮）处理 Tasks 表同一类跨项目并发风险时的判断一致：
+ *   现有的按需定点单元格写入（batchUpdateFieldsByKey_/
+ *   batchReadFieldsByKey_ 只碰实际要改的字段，不整行/整表覆写）已经是
+ *   在没有跨项目锁的前提下能做到的合理缓解，真正的解决需要一次跨三个
+ *   项目的协调决定，记录进 00_Project_State.gs「已知问题」，不假装
+ *   已经修好。
+ *
+ * MEDIUM RISK 1（26_ReminderOffsetEngine.gs checkOffsetReminders，
+ * staleRuleIds 独立于批量 flush 机制之外，函数末尾逐个同步调用
+ * deleteRowByKey_）
+ *   核实：属实。失效规则的删除被排除在分批 flush 机制之外，函数末尾用
+ *   forEach 循环逐个调用 deleteRowByKey_，每次调用都各自完整地开表+读
+ *   表头+扫 key 列定位，一旦本轮累积的失效规则较多，会在函数收尾阶段
+ *   集中拖慢执行、逼近超时。
+ *   修复：① staleRuleIds 改名 ruleDeletes，挪到跟其余五个批量累加数组
+ *   （occUpserts/historyInserts/occDeletes/pendingEvents/ruleUpdates）
+ *   一起最先声明，flush/flushIfNeeded 也跟着提前，循环期间用同一套
+ *   节奏分批处理，不再有"循环内不批、循环外一次性处理"的不一致；②
+ *   21_SheetUtils.gs 新增 batchDeleteRowsByKey_：只读 keyHeader 这一列
+ *   一次，定位给定的一批 key 各自对应哪一行，按行号【降序】依次
+ *   deleteRow()（降序是必须的，不是风格选择——deleteRow 物理删除一行后
+ *   下面所有行的行号都会整体减一，按升序删会删错行），_persistBatch_
+ *   的 ruleDeleteIds 处理改调这个新函数，不再逐个 key 各自开表定位。
+ *   ⚠️ 顺带修复（不在审计报告原文里，但是同一个函数内完全相同的
+ *   反模式，而且触发频率更高）：_persistBatch_ 里
+ *   occurrenceDeleteKeys（每条 occurrence 无论 sent/failed归档/
+ *   cancelled 都会走到这里）用的是一模一样的"逐个 key 调
+ *   deleteRowByKey_"形状，一并换成 batchDeleteRowsByKey_，没有留一个
+ *   显而易见会被下一次审计重新点名的姊妹问题。
+ *
+ * LOW RISK 1（12_TemporalEngine.gs parseRule，Schedule Model 的不可变
+ * 约定没有运行时强制）
+ *   核实：属实——但这不是一个全新发现。这条其实就是 2026-07-12 UEF
+ *   架构评审的 Finding 3，Disposition 当时就是 Confirmed，但优先级
+ *   评估是 Fix Later（跟同一份评审的 Finding 1/2 不同——1/2 是"不修就
+ *   可能放行不合法输入"的 Contract 缺口，Finding 3 是"已经承诺的不
+ *   可变约定没有运行时兜底"，严重度本身评级 LOW，且评审当时
+ *   TemporalEngine 还没有任何真实调用方，"多个模块共享同一个 schedule
+ *   引用"这个风险还没实际发生，按 Progression Rule 不必抢在真实需要
+ *   出现前动手），所以没有跟 Finding 1/2 一起在 2026-07-13 那次补丁
+ *   里改，完整过程见 00_ADR_004_Temporal_Engine_Design.gs 对应条目。
+ *   这次审计报告重新独立点名同一个问题，评估后确认架构评审当时的结论
+ *   依然成立（"一行、对现有测试零影响"），予以采纳，从 Fix Later 提升
+ *   为 Fix Now，详细的"为什么现在提升"理由见 ADR-004「2026-07-15
+ *   修订记录」，不在这里重复。
+ *   修复：parseRule 返回前 Object.freeze(schedule)。sloppy mode（GAS
+ *   默认运行时、Node 沙盒 eval 这份文件时也是）下对冻结对象赋值会
+ *   静默失败、不抛错，不会让现有调用方意外收到新异常。
+ *
+ * === 2026-07-15 GAS Console 实测问题（不在审计报告里，是部署后手动跑
+ * checkOffsetReminders/runReminderOffsetEngineTests/checkReminders 三个
+ * 入口时从 Execution log 里发现的）===
+ *
+ * 问题A（21_SheetUtils.gs parseDueDate_，TypeError:
+ * raw.match is not a function）
+ *   核实：属实，且是这次新增的 26_ReminderOffsetEngine.gs 暴露出的
+ *   既有假设漏洞，不是 OffsetEngine 自己的新 bug。parseDueDate_ 假设
+ *   raw 一定是字符串，直接调 raw.match(...)——但 Google Sheets 对
+ *   日期/日期时间格式的单元格，getValues() 会直接返回原生 Date 对象。
+ *   25_ReminderEngine.gs 的 isOverdue_ 一直是安全的，因为它在调用这里
+ *   之前先 String(dueDateRaw) 过；但 26_ReminderOffsetEngine.gs 的
+ *   _resolveEffectiveDueDatetime_ 是把 task.due_datetime/task.due_date
+ *   直接传进来，不经过这层转换——两个调用方的调用约定本身就不一致，
+ *   parseDueDate_ 之前没出过问题只是因为唯一的调用方（isOverdue_）
+ *   恰好总是先转字符串，不是因为这个函数本身是安全的。
+ *   修复：parseDueDate_ 加一个 Date 类型直接返回的分支（拷贝一份，不
+ *   回传调用方传入的原始引用），非 Date 的输入才按原逻辑走字符串
+ *   解析。按"任意 Sheet 单元格原始值的实际形状"把这个共用函数本身
+ *   加固，不是只在 _resolveEffectiveDueDatetime_ 调用前补一个
+ *   String() 转换来绕过——后者只能保证这一个调用方不出问题，前者能
+ *   保证以后任何直接传 Date 对象进来的新调用方都不出问题。用原始报错
+ *   堆栈的场景（task.due_date 是原生 Date 对象、没有
+ *   due_datetime/due_time）复现过，确认改完不再抛错。
+ *
+ * 问题B（5_Testing/50_ReminderOffsetEngine_Tests.gs resetAll，
+ * ReferenceError: global is not defined）
+ *   核实：属实，但根因不是"忘了兼容 GAS 环境"，是这份测试套件设计上就
+ *   只能通过 Node 沙盒（run_offset_tests.js + mocks.js）运行——见文件
+ *   头部说明——被直接贴进 Apps Script 编辑器手动运行了。即使把
+ *   resetAll 里的 global 换成某个 GAS 侧的等价写法，紧接着
+ *   __resetStore/__seedSheet 等 mock 函数依然不存在（整套 mock 只
+ *   存在于 mocks.js，从未被加载进 GAS 项目），不是换一个全局对象名字
+ *   能解决的。
+ *   处理方式（不是"让它能在GAS里跑"，是"给清楚的报错，别再让人在深埋
+ *   的地方撞见一个指向不明的 ReferenceError"）：
+ *   runReminderOffsetEngineTests 开头新增环境检测，检测不到 Node 沙盒
+ *   特征（global 或 global.__resetStore）时，直接 throw 一个说明"这
+ *   份套件只能通过 node run_offset_tests.js 运行"的 Error，Logger.log
+ *   同步输出。
+ *
+ * 问题C（4_Integration/40_Output.gs sendMessage，调用方日志打出
+ * "error=undefined"）
+ *   核实：属实。Telegram API 返回业务级失败（body.ok===false，比如
+ *   "Bad Request: chat not found"）时，sendMessage 原来是直接 return
+ *   body——也就是原样转发 Telegram 的失败响应，用的是
+ *   error_code/description 两个字段。但同一个函数其余三条失败路径
+ *   （缺 token/缺 chat_id/catch块）统一用的是 {ok:false, error:'...'}
+ *   形状。25_ReminderEngine.gs 的 checkReminders、
+ *   26_ReminderOffsetEngine.gs 的 checkOffsetReminders 读的都是
+ *   sendResult.error，对 Telegram 业务级失败这条最常见的路径来说永远
+ *   是 undefined——不是日志拼接的字符串写错了，是从一开始这个分支的
+ *   返回值就没有这个字段。
+ *   修复：这个分支 return 之前补一个 error 字段（优先取
+ *   description，没有的话退化成 error_code），不删除原始的
+ *   error_code/description（不丢信息，只是补齐调用方依赖的统一字段）。
+ *
+ * === 第五轮验证方式 ===
+ *
+ * 4个 Node 沙盒测试套件（run_sheetutils_tests.js/run_eventbus_tests.js/
+ * run_output_tests.js/run_offset_tests.js，可以用新增的
+ * run_all_tests.js 一次性全部跑）+ 1个 GAS 原生套件
+ * （50_TemporalEngine_Tests.gs，设计上贴进 GAS 编辑器直接跑，这次改动
+ * 后额外在 Node 里补跑一次 Logger mock 版本做二次确认），全部通过，共
+ * 115 个断言（TemporalEngine 45 + SheetUtils 18 + EventBus 12 +
+ * Output 8 + OffsetEngine 32）：
+ *   - TemporalEngine：原有43个断言 + 新增2个（Object.isFrozen 直接
+ *     验证、对冻结对象赋值静默失败不生效）。
+ *   - OffsetEngine：原有28个断言 + 新增4个（场景F：到期时间改早、且
+ *     改早前该 channel 已经 resolve 过，验证不再被误判为已处理；场景F
+ *     对照组：紧接着不改期再poll一次，确认没有连带破坏"没改期就不
+ *     重发"这个基本幂等性）。
+ *   - SheetUtils（全新，此前完全没有专属测试文件）：18个断言，覆盖
+ *     parseDueDate_ 的 Date 对象兼容（含"不应该抛错"和"返回值是拷贝
+ *     不是同一个引用"两层）、batchReadFieldsByKey_ 用故意不连续的
+ *     命中行验证包络读取不会读串数据、batchDeleteRowsByKey_ 用故意
+ *     跳着删的行验证降序删除不会因为行号错位而删错行。
+ *   - EventBus（全新）：12个断言，验证 publishBatch 改成 appendRow
+ *     循环之后基本正确性不受影响（数据映射、顺序、连续两次调用不互相
+ *     覆盖、identity 去重继续生效）——注意"改了之后并发场景真的不会
+ *     丢数据"这件事本身不是单元测试能验证的，这里验证的是重写没有
+ *     引入基本正确性回归，不是验证了并发安全性本身。
+ *   - Output（全新）：8个断言，直接复现"error=undefined"这个具体
+ *     报错场景并验证修复后 error 字段正确。
+ *   顺手发现并修复 run_offset_tests.js 里硬编码的4个文件路径是上一次
+ *   会话沙盒的绝对路径（/home/claude/work/output/*.gs），换个环境就
+ *   读不到文件，本身是这套测试基础设施的一个可移植性 bug——改成相对
+ *   本文件自身所在目录动态拼接。
+ *
+ * === 第五轮后果 ===
+ *
+ * - 1_Foundation/12_TemporalEngine.gs：parseRule 返回前新增
+ *   Object.freeze(schedule)。
+ * - 2_Runtime/20_EventBus.gs：publishBatch 内部实现从
+ *   getLastRow()+setValues() 改成逐行 appendRow()，对外行为/签名不变。
+ * - 2_Runtime/21_SheetUtils.gs：parseDueDate_ 新增 Date 类型兼容分支；
+ *   batchReadFieldsByKey_ 内部实现改成包络 getValues()+内存查找，对外
+ *   行为/签名不变；新增 batchDeleteRowsByKey_。对外暴露函数数量从13个
+ *   增加到14个。
+ * - 2_Runtime/25_ReminderEngine.gs：checkReminders 的 LockService
+ *   调用点新增注释说明 HIGH RISK 4 的评估过程，逻辑本身未改。
+ * - 2_Runtime/26_ReminderOffsetEngine.gs：checkOffsetReminders 的
+ *   resolved_fire_ats 语义变更（存到期时间快照而非fireAt）；
+ *   ruleDeletes/occurrenceDeleteKeys 改用批量删除；LockService 调用点
+ *   新增 HIGH RISK 4 评估注释。
+ * - 4_Integration/40_Output.gs：sendMessage 在 Telegram 业务级失败
+ *   分支新增 error 字段补齐，不改变其余返回结构。
+ * - 5_Testing/：新增 50_SheetUtils_Tests.gs/50_EventBus_Tests.gs/
+ *   50_Output_Tests.gs 三份此前完全没有覆盖的测试文件（范围只覆盖这次
+ *   改到的函数，不是这三个源文件的全量覆盖，各自文件头有说明）；
+ *   50_ReminderOffsetEngine_Tests.gs 新增场景F；
+ *   50_TemporalEngine_Tests.gs 新增2个断言。run_offset_tests.js 路径
+ *   可移植性修复；新增 run_sheetutils_tests.js/run_eventbus_tests.js/
+ *   run_output_tests.js/run_all_tests.js。
+ * - HIGH RISK 4（跨项目 LockService 不生效）没有被"修复"，只是被更
+ *   清楚地"文档化"——这是本轮6项里唯一一条本质上无法在 Reminder OS
+ *   单个项目内解决的，如实记录在 00_Project_State.gs「已知问题」，不
+ *   假装已经修好，跟第一轮 MEDIUM RISK 1（webhook 依赖）、第四轮
+ *   MEDIUM RISK 2（Telegram送达状态不确定）是同一类处理方式。
+ * - ⚠️ 已知文档缺口（不是这轮修复的一部分，如实记录）：
+ *   00_File_Map.gs/00_Project_State.gs 在这轮之前就已经不包含 Offset
+ *   Reminder Engine（2_Runtime/26_ReminderOffsetEngine.gs）的完整设计
+ *   历史——该功能是在第四轮（2026-07-10/11）之后、这次审计
+ *   （2026-07-15）之前新增的，经过多轮设计精化，但那个过程没有被记录
+ *   进这两份文件。这次只在 File Map 里为该文件和它的测试文件补了
+ *   【最小占位记录】（标注了"非完整设计历史"），没有尝试回填完整的
+ *   设计过程——那需要重新过一遍设计文档和历次精化的完整上下文，不是
+ *   这次审计修复顺手能做的事，建议单独排一次任务处理。
  */

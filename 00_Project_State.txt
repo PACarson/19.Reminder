@@ -3,7 +3,18 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-11 — 拿到 Productivity OS 代码，解决第三轮
+ * LAST_UPDATED: 2026-07-15 — 修复第五轮外部审计发现的 HIGH RISK 1-4、
+ * MEDIUM RISK 1 共5项 + 顺带同一反模式的 occurrenceDeleteKeys、LOW
+ * RISK 1（TemporalEngine Finding 3 从 Fix Later 提升为 Fix Now）；
+ * 另修复同日 GAS Console 实测的3个问题（parseDueDate_ 对 Date 对象
+ * 抛错、离线测试套件在 GAS 里跑会报 ReferenceError、Output.sendMessage
+ * 的 error 字段在 Telegram 业务级失败时始终 undefined）。HIGH RISK 4
+ * （跨项目 LockService 不生效）核实属实但无法从 Reminder OS 单个项目
+ * 内解决，新增到「已知问题」。新增3份此前完全没有覆盖的测试文件
+ * （SheetUtils/EventBus/Output），测试从前四轮遗留的71项（TemporalEngine
+ * 43 + OffsetEngine 28）增加到115项全部通过。完整决策依据见 00_ADR_002
+ * 「第五轮外部审计」和 00_ADR_004「2026-07-15 修订记录」。
+ * 2026-07-11 — 拿到 Productivity OS 代码，解决第三轮
  * 外部审计遗留的 HIGH RISK 2（QueryEngine 读整张 Tasks 表的性能问题），
  * getPendingTasks() 改为从 ActiveTasks 取候选+对 Tasks 定点查两个字段；
  * 记录两个调查过程中发现的、跟 Productivity OS 有关但不是本项目能修的
@@ -233,6 +244,58 @@
  *   ActiveTasks）+ 1组新回归测试（ActiveTasks 不存在时优雅降级不崩溃），
  *   加上前四轮遗留的全部测试（第四轮换用 Productivity OS 真实 schema
  *   重新构造夹具后）一并重跑，全部通过，确认无回归。
+ *
+ * - 2026-07-15：修复第五轮外部审计发现（HIGH RISK 1-4、MEDIUM RISK 1）+
+ *   同日 GAS Console 实测的3个问题，完整依据见
+ *   00_ADR_002_ReminderEngine_Audit_Fixes.gs 的「第五轮外部审计」章节：
+ *   · HIGH RISK 1：26_ReminderOffsetEngine.gs 的幂等判断改成比对到期
+ *     时间快照而非 fireAt 大小，修复"到期时间改早会被误判成已处理"的
+ *     bug。
+ *   · HIGH RISK 2：20_EventBus.gs 的 publishBatch 从
+ *     getLastRow()+setValues() 改成逐行 appendRow()（GAS 保证原子），
+ *     消除三个独立项目共享 Events 表时的静默覆盖风险。
+ *   · HIGH RISK 3：21_SheetUtils.gs 的 batchReadFieldsByKey_ 从逐格
+ *     getValue() 改成一次包络 getValues()+内存查找。
+ *   · HIGH RISK 4：核实属实、无法从 Reminder OS 单个项目内解决，见下面
+ *     「已知问题」新增条目，不假装已经修好。
+ *   · MEDIUM RISK 1：26_ReminderOffsetEngine.gs 的 ruleDeletes 并入
+ *     批量 flush 节奏，21_SheetUtils.gs 新增 batchDeleteRowsByKey_
+ *     取代逐个 deleteRowByKey_；顺带发现并修复同一个函数里完全相同
+ *     反模式的 occurrenceDeleteKeys（触发频率更高）。
+ *   · LOW RISK 1：这条其实是 2026-07-12 TemporalEngine 架构评审
+ *     Finding 3，当时 disposition 是 Fix Later，这次审计重新点名，
+ *     予以采纳提升为 Fix Now——12_TemporalEngine.gs 的 parseRule 现在
+ *     Object.freeze 返回的 schedule。完整提升理由见 00_ADR_004
+ *     「2026-07-15 修订记录」。
+ *   ⚠️ 同日另修复3个不在审计报告里、是部署后手动跑
+ *   checkOffsetReminders/runReminderOffsetEngineTests/checkReminders
+ *   三个入口从 Execution log 里发现的问题：
+ *   · 21_SheetUtils.gs 的 parseDueDate_ 假设 raw 一定是字符串，遇到
+ *     Sheets 日期格式单元格返回的原生 Date 对象会抛
+ *     "TypeError: raw.match is not a function"——加了 Date 类型直接
+ *     返回的分支。
+ *   · 50_ReminderOffsetEngine_Tests.gs 的 resetAll 用了 Node 专属的
+ *     global，直接贴进 GAS 编辑器跑会报 ReferenceError——这份套件设计
+ *     上只能走 Node 沙盒，改成显式检测环境+给可操作的报错。
+ *   · 40_Output.gs 的 sendMessage 在 Telegram 业务级失败时原样转发
+ *     Telegram 的 error_code/description，没有补上其余分支都有的
+ *     error 字段，导致两个引擎读 sendResult.error 永远是
+ *     undefined——补上了这个字段，不删除原始字段。
+ *   新增3份此前完全没有覆盖的测试文件（5_Testing/50_SheetUtils_Tests.gs/
+ *   50_EventBus_Tests.gs/50_Output_Tests.gs，范围只覆盖这次改到的
+ *   函数，各自文件头有说明），50_ReminderOffsetEngine_Tests.gs 新增
+ *   场景F（到期时间改早的回归测试），50_TemporalEngine_Tests.gs 新增
+ *   Object.freeze 验证。测试总数从71（TemporalEngine 43 + OffsetEngine
+ *   28）增加到115，全部通过——4个 Node 沙盒套件可以用新增的
+ *   run_all_tests.js 一次性跑完。顺手修复 run_offset_tests.js 里硬编码
+ *   的上一次会话沙盒绝对路径，改成相对本文件目录动态拼接，否则换个
+ *   环境就读不到文件。
+ *   ⚠️ 已知文档缺口：00_File_Map.gs/00_Project_State.gs（本文件）在
+ *   这轮之前就已经不包含 Offset Reminder Engine（第四轮之后新增，经过
+ *   多轮设计精化）的完整设计历史，也不包含 2026-07-12 TemporalEngine
+ *   架构评审本身的记录。这次只在 File Map 里补了最小占位记录，没有
+ *   回填完整设计过程——需要单独排一次任务，重新过一遍设计文档和历次
+ *   精化的完整上下文才能做，不是这次审计修复顺手能完成的。
  */
 
 // ============================================================
@@ -339,6 +402,33 @@
  *     否则这个统计字段实际上不会被真实的提醒发送行为更新，可能从设计
  *     出来就没真正生效过。这也不是本项目能确认或修复的问题（不涉及
  *     Reminder OS 拥有的任何数据），只是如实记录。
+ *
+ * - 【第五轮审计核实属实、无法从 Reminder OS 单个项目内解决，理由见
+ *   ADR-002「第五轮外部审计」HIGH RISK 4】
+ *   · checkReminders（25_ReminderEngine.gs）/checkOffsetReminders
+ *     （26_ReminderOffsetEngine.gs）都用 LockService.getScriptLock()
+ *     提供互斥保障，但 Script Lock 只在当前脚本项目内部起作用，无法
+ *     阻止 Personal AI Core（处理 Telegram 按钮回调）或 Productivity
+ *     OS 在本项目执行期间并发写共享的 Tasks/ReminderRules/Events 等表。
+ *     审计给的两条修法（跨项目共享锁定表 / 三个项目迁移成同一 Spreadsheet
+ *     下的容器绑定脚本以用 LockService.getDocumentLock()）都需要
+ *     Personal AI Core 和 Productivity OS 同步配合或迁移，不是能在
+ *     Reminder OS 一个项目里单方面决定并且改掉的事，这次也看不到那两个
+ *     项目的代码去确认可行性。现有的按需定点单元格写入
+ *     （batchUpdateFieldsByKey_/batchReadFieldsByKey_ 只碰实际要改的
+ *     字段，不整行/整表覆写，见 MEDIUM RISK 1「第四轮」）已经是在没有
+ *     跨项目锁的前提下能做到的合理缓解。如果 Carson 想真正关掉这条风险，
+ *     需要拉上 Personal AI Core / Productivity OS 一起定协议或评估迁移
+ *     可行性，具体需要什么见「下一步」。
+ *
+ * - 【已知文档缺口，2026-07-15 修复第五轮审计时顺手发现，不是本次修复
+ *   范围内的事】00_File_Map.gs 和本文件在第四轮（2026-07-10/11）之后、
+ *   第五轮审计（2026-07-15）之前，都没有跟上项目的实际进展——期间新增
+ *   了完整的 Offset Reminder Engine（2_Runtime/26_ReminderOffsetEngine.gs
+ *   + 5_Testing/50_ReminderOffsetEngine_Tests.gs，经过多轮设计精化，
+ *   引入了 Project Constitution P8/P9），也做过一次独立的 TemporalEngine
+ *   UEF 架构评审（2026-07-12）。这次只在 File Map 里为 OffsetEngine
+ *   相关文件补了最小占位记录，没有回填完整的设计历史。
  */
 
 // ============================================================
@@ -389,6 +479,19 @@
  *   8. 接入其他 Domain OS 的提醒需求时（比如 Property OS 的房租到期），
  *      在 checkReminders() 里加一段查询对应共享表的逻辑，参照现在查
  *      Tasks 表的写法。不需要新建 Bridge/Library 依赖。
+ *   9. 如果想真正关掉 HIGH RISK 4（跨项目 LockService 不生效，见「已知
+ *      问题」），需要 Personal AI Core / Productivity OS 的代码或至少
+ *      配合——要么三个项目一起实现并遵守同一套共享锁定表协议，要么评估
+ *      三个项目迁移成同一 Spreadsheet 下容器绑定脚本的可行性（影响面
+ *      更大，涉及三个项目各自的部署方式）。跟 MEDIUM RISK 1（第一轮，
+ *      webhook 依赖）性质相同：单看 Reminder OS 这边的代码没法验证或
+ *      推进这件事。
+ *   10. 00_File_Map.gs/本文件目前只用最小占位记录带过了 Offset Reminder
+ *      Engine（2_Runtime/26_ReminderOffsetEngine.gs）的完整设计历史和
+ *      2026-07-12 TemporalEngine 架构评审——如果想让这两份治理文档重新
+ *      完整覆盖项目实际状态，需要单独排一次任务，把设计文档
+ *      （Reminder-OS_Time-Based-Reminder-Engine_Design-Proposal.md）和
+ *      历次精化的完整过程重新过一遍再写，不是顺手能做的事。
  */
 
 // ============================================================

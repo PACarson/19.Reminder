@@ -3,10 +3,12 @@
  * Reminder OS — 架构决策记录 #004
  *
  * STATUS: Accepted — Gate Review（A0→A1）已过，A1 实现 + Disposition
- * Review 的 Fix Now 项（Finding 1、2、4）已完成
+ * Review 的全部4项 Finding（1/2/3/4）已完成，无遗留 Fix Later 项
  * DATE: 2026-07-06（初版），2026-07-06（同日修订：并入 Gate Review 确认
  * 的5点 + 4条精化，见「2026-07-06 修订记录」），2026-07-13（Disposition
- * Review 后的 Contract 补充，见文末「2026-07-13 修订记录」）
+ * Review 后的 Contract 补充，见文末「2026-07-13 修订记录」），2026-07-15
+ * （Finding 3 从 Fix Later 提升为 Fix Now 并完成，见文末「2026-07-15
+ * 修订记录」）
  */
 
 /**
@@ -435,4 +437,43 @@
  *   Gate Review 额外发现的边界情况，不重新打开 Exit Criteria 本身。
  * - Phase B（Reminder Scheduler，recurring reminder）依然按 Progression
  *   Rule 不自动开始，需要真实需求驱动，这次修订不改变这一点。
+ *
+ * === 2026-07-15 修订记录 ===
+ *
+ * 外部审计（第五轮，见 00_ADR_002_ReminderEngine_Audit_Fixes.gs「第五轮
+ * 外部审计」章节 LOW RISK 1）独立重新点名 Finding 3（Object.freeze 未
+ * 强制 immutability）——不是一个新发现，是 2026-07-13 修订记录里已经
+ * Confirmed、但当时 disposition 为 Fix Later 的同一条。评估后确认
+ * 2026-07-12 架构评审当时的结论依然成立（"return
+ * Object.freeze(schedule); 一行、对现有测试零影响"），予以采纳，
+ * disposition 从 Fix Later 提升为 Fix Now。
+ *
+ * 提升理由：当时 Fix Later 的核心依据是"目前零调用方，保护的场景还不
+ * 存在"——这一点本身没有变化（TemporalEngine 到这次修订为止依然没有
+ * 任何调用方，Phase B 仍未开始），不是"因为出现了真实调用方才被迫修"。
+ * 单纯是因为这次有了第二个独立信号（外部审计重新点名同一个问题）、且
+ * 修复本身成本极低（一行、零测试影响，2026-07-13 评估时已经确认过），
+ * 所以按这次审计的要求一并处理，不再等待真实调用方出现——这跟 Fix
+ * Later 当初"不为还不存在的场景抢跑"的判断不矛盾，只是优先级判断在
+ * 新增信息（第二次独立点名）下的重新校准。
+ *
+ * 修复：parseRule 返回前 Object.freeze(schedule)，本身不涉及 Contract
+ * 变更（跟 2026-07-13 记录的判断一致：Contract 本来就已经写明 Schedule
+ * Model immutable，缺的一直是 runtime 强制，不是 Contract 本身有漏洞）。
+ * 5_Testing/50_TemporalEngine_Tests.gs 新增2个断言：直接验证
+ * Object.isFrozen(schedule) 为 true；以及对已冻结对象的字段赋值会静默
+ * 失败、不生效（sloppy mode 下不抛错，这一点在两处运行环境——GAS 默认
+ * 运行时、这份文件被 eval 进 Node 沙盒时——都成立）。测试从 43/43 增加到
+ * 45/45，全部通过。
+ *
+ * === 后果（2026-07-15 更新）===
+ *
+ * - Finding 3 现在也已实现并验证，4个 LOW finding（Finding 1/2/3/4）
+ *   全部处理完毕，没有遗留的 Fix Later 项。
+ * - 这不改变 Gate 已经是 Go（不再是 Conditional Go）的结论——Finding 3
+ *   本来就不在 Gate Review 的 Condition 范围内，这次只是把一条本来就
+ *   打算"以后有需要再做"的可选加固提前做掉，不是补一个之前被忽略的
+ *   必要条件。
+ * - Phase A/Phase B 的状态不变，完整历史见上面「2026-07-13 修订记录」
+ *   和「后果」。
  */
