@@ -3,7 +3,12 @@
  * Reminder OS v1.0 — 项目状态快照
  *
  * ⚠️ 快照，不是日志。
- * LAST_UPDATED: 2026-07-15 — 修复第五轮外部审计发现的 HIGH RISK 1-4、
+ * LAST_UPDATED: 2026-07-17 — 支持 Productivity OS 新增的
+ * Task.reminder_policy 字段（创建任务时覆盖默认提醒策略），
+ * 26_ReminderOffsetEngine.gs 的 _ensureDefaultRules_ 改名并扩展为读取
+ * reminder_policy 优先于默认常量，落地时机采用窄口径（只在首次物化
+ * 生效）。完整决策记录见 00_ADR_006_Reminder_Policy_Override.gs。
+ * 2026-07-15 — 修复第五轮外部审计发现的 HIGH RISK 1-4、
  * MEDIUM RISK 1 共5项 + 顺带同一反模式的 occurrenceDeleteKeys、LOW
  * RISK 1（TemporalEngine Finding 3 从 Fix Later 提升为 Fix Now）；
  * 另修复同日 GAS Console 实测的3个问题（parseDueDate_ 对 Date 对象
@@ -296,6 +301,21 @@
  *   架构评审本身的记录。这次只在 File Map 里补了最小占位记录，没有
  *   回填完整设计过程——需要单独排一次任务，重新过一遍设计文档和历次
  *   精化的完整上下文才能做，不是这次审计修复顺手能完成的。
+ *
+ * - 2026-07-17：支持 Productivity OS 新增的 Task.reminder_policy 字段
+ *   （用户创建任务时可以直接覆盖默认提醒策略），完整跨项目架构审查+
+ *   Carson 决策记录见 00_ADR_006_Reminder_Policy_Override.gs。
+ *   26_ReminderOffsetEngine.gs 的 _ensureDefaultRules_ 改名
+ *   _ensureRulesFromPolicy_ 并扩展：taskIdsWithRules 未命中时先读
+ *   task.reminder_policy 决定生成默认规则还是用户覆盖的规则，为 null 时
+ *   行为逐字节不变（旧名字保留 @deprecated wrapper）。stats 新增
+ *   overrideRulesCreated 字段。落地时机是窄口径——只在首次物化那一刻生效，
+ *   不引入持续 Rebuild（Carson 决定，理由是保持职责边界和现有引擎的成本
+ *   模型，不是单纯省扫描次数）。"不要提前提醒"（reminder_policy.offsets=[]）
+ *   不影响 25_ReminderEngine.gs（V1）的到期提醒，两者继续完全独立。
+ *   50_ReminderOffsetEngine_Tests.gs 新增场景 G/H/I + _offsetToMinutes_
+ *   的纯函数测试。本次改动完全不涉及 Personal AI Core、Connector Layer、
+ *   12_TemporalEngine.gs、22_QueryEngine.gs。
  */
 
 // ============================================================
