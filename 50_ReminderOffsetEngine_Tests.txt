@@ -99,6 +99,14 @@ function runReminderOffsetEngineTests() {
   check('offsetLabel: 60分钟 → 1 hour(s) before', ReminderOffsetEngine._offsetLabel_(60), '1 hour(s) before');
   check('offsetLabel: 15分钟 → 15 minute(s) before', ReminderOffsetEngine._offsetLabel_(15), '15 minute(s) before');
 
+  // ---------- _offsetToMinutes_（ADR-2026-07-17-006 新增）----------
+
+  check('offsetToMinutes: {30, minutes} → 30', ReminderOffsetEngine._offsetToMinutes_({ value: 30, unit: 'minutes' }), 30);
+  check('offsetToMinutes: {2, hours} → 120', ReminderOffsetEngine._offsetToMinutes_({ value: 2, unit: 'hours' }), 120);
+  check('offsetToMinutes: {3, days} → 4320', ReminderOffsetEngine._offsetToMinutes_({ value: 3, unit: 'days' }), 4320);
+  check('offsetToMinutes: 无法识别的 unit → null', ReminderOffsetEngine._offsetToMinutes_({ value: 5, unit: 'weeks' }), null);
+  check('offsetToMinutes: value 不是数字 → null', ReminderOffsetEngine._offsetToMinutes_({ value: '30', unit: 'minutes' }), null);
+
   // ---------- Integration: checkOffsetReminders() 完整 poll cycle ----------
   // design doc §10 Testing：mock 一个 getPendingTasks() 结果，跑一整轮
   // checkOffsetReminders()，断言落在表里的结果——这是设计文档明确要求的
@@ -227,6 +235,67 @@ function runReminderOffsetEngineTests() {
   //     （确认场景F的修复没有连带破坏"没改期就不重发"这个基本幂等性） ---
   var statsFRepeat = ReminderOffsetEngine.checkOffsetReminders();
   check('场景F对照组（紧接着再poll一次，到期时间不变）: 不应该重复发送', statsFRepeat.sent, 0);
+
+  // --- 场景 G（ADR-2026-07-17-006，reminder_policy override）：全新 task，
+  //     创建时显式指定 override（30分钟前一条），到期时间是20分钟前
+  //     （已经过了30分钟前这个 fire_at）——应该只生成1条 user_override
+  //     规则，不生成默认的3条，且这1条应该立刻发送成功 ---
+  resetAll();
+  var dueInPastG = new Date(Date.now() - 20 * 60000);
+  global.__mockPendingTasks = [{
+    task_id: 'TASK-G', chat_id: 'CHAT-1', title: '测试任务G',
+    due_datetime: dueInPastG.toISOString(),
+    reminder_policy: JSON.stringify({ offsets: [{ value: 30, unit: 'minutes' }] })
+  }];
+
+  var statsG = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景G（reminder_policy override）: 不应该生成默认规则', statsG.defaultRulesCreated, 0);
+  check('场景G: 应该生成1条override规则', statsG.overrideRulesCreated, 1);
+  check('场景G: 应该发送成功1条', statsG.sent, 1);
+  var rulesG = global.__readSheetRows('ReminderRules');
+  check('场景G: Rules表应该恰好1条', rulesG.length, 1);
+  check('场景G: 规则的source应该是user_override', rulesG[0].source, 'user_override');
+  check('场景G: 规则的offset_minutes应该是30（30分钟换算）', Number(rulesG[0].offset_minutes), 30);
+
+  // --- 场景 H（ADR-2026-07-17-006，reminder_policy.offsets=[]）：用户创建
+  //     时显式声明"不要提前提醒"——不应该生成任何规则、不应该有任何发送。
+  //     V1（25_ReminderEngine.gs）的到期提醒是完全独立的机制，从不读
+  //     reminder_policy，不在这份测试的覆盖范围内（Carson决定#1）---
+  resetAll();
+  var dueInPastH = new Date(Date.now() - 20 * 60000);
+  global.__mockPendingTasks = [{
+    task_id: 'TASK-H', chat_id: 'CHAT-1', title: '测试任务H',
+    due_datetime: dueInPastH.toISOString(),
+    reminder_policy: JSON.stringify({ offsets: [] })
+  }];
+
+  var statsH = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景H（不要提前提醒）: 不应该生成默认规则', statsH.defaultRulesCreated, 0);
+  check('场景H: 不应该生成override规则', statsH.overrideRulesCreated, 0);
+  check('场景H: 不应该有任何发送', statsH.sent, 0);
+  var rulesH = global.__readSheetRows('ReminderRules');
+  check('场景H: Rules表应该是空的', rulesH.length, 0);
+
+  // --- 场景 H 对照组：紧接着再poll一次，验证"不生成规则天然幂等，不需要
+  //     额外标记已处理过"这一点（见 _ensureRulesFromPolicy_ 函数头注释）---
+  var statsHRepeat = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景H对照组（重复poll，reminder_policy仍是空数组）: 依然不应该生成任何规则', statsHRepeat.defaultRulesCreated, 0);
+  check('场景H对照组: 依然不应该有发送', statsHRepeat.sent, 0);
+
+  // --- 场景 I（ADR-2026-07-17-006）：reminder_policy 是无法解析的乱码
+  //     字符串（不是合法JSON）——应该安全退回到当作null处理，走默认规则
+  //     生成，不应该抛错崩溃 ---
+  resetAll();
+  var dueInPastI = new Date(Date.now() - 90 * 60000);
+  global.__mockPendingTasks = [{
+    task_id: 'TASK-I', chat_id: 'CHAT-1', title: '测试任务I',
+    due_datetime: dueInPastI.toISOString(),
+    reminder_policy: '不是合法JSON{{{'
+  }];
+
+  var statsI = ReminderOffsetEngine.checkOffsetReminders();
+  check('场景I（reminder_policy解析失败，安全退回默认）: 应该生成3条默认规则', statsI.defaultRulesCreated, 3);
+  check('场景I: 不应该生成override规则', statsI.overrideRulesCreated, 0);
 
   // ---------- Quiet Hours 门控（不改变materialize，只影响是否实际发送）----------
 

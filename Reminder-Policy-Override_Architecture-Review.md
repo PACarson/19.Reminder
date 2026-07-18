@@ -1,6 +1,6 @@
 # Reminder Policy Override — Architecture Review & Optimized Design
 
-**Status:** DRAFT — architecture review only, supersedes the original enhancement proposal pending Carson's decisions on the three open items in §7. Not implemented.
+**Status:** IMPLEMENTED（2026-07-17）— 架构评审通过后已完成实现，见文末「实现记录」。Carson confirmed the three open items in §7. Supersedes the original enhancement proposal.
 
 **Method:** 本文基于对 Personal-AI-main / Productivity-OS-main / Reminder-OS-main 三个项目实际源码与治理文档的审查（Connector Layer contracts、TaskIntentParser、TaskEngine、ReminderOffsetEngine、各自 Constitution/ADR/Known Limitations），而非仅从原始需求文本推演。原文档的若干假设与当前已实现的架构存在偏差，本文逐条订正并给出依据，力求成为可以直接替代原文档、进入实现阶段的版本。
 
@@ -91,27 +91,24 @@ Reminder OS · 26_ReminderOffsetEngine.gs                         ← 改动 ④
 
 ### 3.2 Reminder OS 规则生成逻辑扩展
 
-`_ensureDefaultRules_`（建议改名 `_ensureRulesFromPolicy_`）现有判断依据是"这个 `task_id` 在 `ReminderRules` 里有没有任何行"（`taskIdsWithRules`）。新版本在此之外先检查 `task.reminder_policy`：
+`_ensureDefaultRules_`（建议改名 `_ensureRulesFromPolicy_`）现有判断依据是"这个 `task_id` 在 `ReminderRules` 里有没有任何行"（`taskIdsWithRules`）。这个"只在首次见到时生成一次"的门槛，正是需要配合决定 #3（Task > ReminderRules，§7）一起明确的地方：
 
-- **null**：`taskIdsWithRules` 未命中时按 `DEFAULT_REMINDER_OFFSETS_MINUTES` 生成，`source: auto_default`——现状完全不变。
-- **`offsets` 非空**：`taskIdsWithRules` 未命中时按这些 offset 生成，`source: user_override`——跟 auto_default 共用同一套"只在首次见到时生成"机制，不需要新的去重逻辑。
-- **`offsets` 为空数组**：不生成任何规则行，**且不需要任何"已处理过"的标记**——"不生成"这个动作天然幂等，每轮重新读一次 `task.reminder_policy`（本来就要从 `pendingTasks` 里取）成本可忽略，不需要为了"记住已跳过"而造占位数据。这比原文档"materialize only Due Reminder"更简单，也避免把 §3.3 的开放问题带进这一层实现。
+- **null**：沿用现有 `taskIdsWithRules` 门槛，按 `DEFAULT_REMINDER_OFFSETS_MINUTES` 生成，`source: auto_default`——现状完全不变。这类 task 没有具体的"Task 侧权威值"可供比对（null 只表示"用默认策略"，不是一条具体声明），**现有"直接改表"escape hatch 对这类 task 维持不变**：人工改过之后不会被自动纠正回默认值。这与决定 #3 不冲突——Task > ReminderRules 针对的是 Task 上有具体内容需要保持一致的情况，null 没有这样的内容。
+- **`offsets` 非空（用户创建时显式指定）**：这类 task 才是决定 #3 真正适用的对象——`reminder_policy` 是明确 Truth，ReminderRules 是它的 Projection。落地方式见下。
+- **`offsets` 为空数组**：不生成任何规则行，不需要标记——已由决定 #1 确认为最终行为，见 §3.3。
 
-**需要 Carson 决定、不适合单方面假设的边界情况：** 若一个 task 已有人工直接改表加的 `source: manual` 规则行，创建时又带 `reminder_policy` override，`taskIdsWithRules` 会命中，override 会被静默跳过——这跟现有 auto_default 对 manual 的让步一致（先来后到），但这是新增的第三条路径，建议显式写注释说明这是沿用既有优先级，而非疏漏（对应 §7 第3项）。
+**决定 #3 落地时机——已由 Carson 最终确认，窄口径。** Offset Engine 第一次发现该 task（`taskIdsWithRules` 未命中）时，按当时的 `task.reminder_policy` 生成规则；生成完成后不再持续比对。理由不是省扫描次数，而是保持 Reminder OS 现有"首次物化、后续只调度"这一运行模型和职责边界——手工直接改表（或改共享 Sheet）是本阶段之外的 escape hatch，不在这次的自动纠正范围内；未来如果加入"编辑 reminder policy"能力，由那个能力自己设计 Re-materialization/Rebuild 流程，不让 Offset Engine 的热路径承担持续一致性检查。
 
-### 3.3 关于"Due Reminder"——需要你决定，不是我可以替你定的
+*实现层面一个极小的精确点（LOW，不影响上述决定，仅供写代码时对齐）：* "首次物化"应理解为"生成动作以 `reminder_policy` 为准"，而不是"`taskIdsWithRules` 命中就整体跳过"——避免任务刚创建、Offset Engine 还没来得及处理之前，如果碰巧已经有一行手工数据，导致这次物化被完全跳过、`reminder_policy` 从未真正生效过。这是现有 `taskIdsWithRules` 门槛本来就有的一个理论边界情况（对 auto_default 同样成立，从未出现过实际问题），沿用 Evidence-first 原则不作为新风险处理，只作为实现时的对齐说明。
 
-原文档"no advance reminder → only due reminder"这句话，在当前真实架构下有两种不冲突但语义不同的落地方式：
+### 3.3 "Due Reminder" 语义——已由决定 #1 确认
 
-- **方案 A（推荐，改动更小）：** 把 `offset_minutes = 0` 当成 OffsetEngine 现有机制里的普通一员——`fireAt = effectiveDue - 0 = effectiveDue`，到期时刻触发一次。不需要 OffsetEngine 新增任何代码路径，"空数组"分支的行为从"不生成"改成"生成一条 offset=0 的规则"。
-- **方案 B：** "Due Reminder"指现有 `25_ReminderEngine.gs`（V1，`checkReminders`，每小时触发，按 `REMINDER_INTERVAL_HOURS[priority]` 重复提醒直到完成）——即什么都不用做，因为 V1 和 V2（OffsetEngine）本来就是两套独立并行机制（各自 trigger：`checkReminders` 每小时、`checkOffsetReminders` 每5分钟），V1 完全不知道 `reminder_policy` 概念，不管这次改不改都会按自己节奏继续跑。
-
-两者的真实产品行为不同：方案 A 是"到期那一刻提醒一次就不再提醒"；方案 B 是"到期前后按优先级持续重复提醒，直到任务完成或取消"。这是需要你确认的产品决策，不是实现细节。
+采用方案 B：`reminder_policy.offsets = []` 语义只有一个——不建立任何 Offset Reminder。不关闭现有 V1（`25_ReminderEngine.gs`）的到期提醒，不自动产生 offset=0 特殊规则。理由：Offset Reminder（提前提醒）和 Due Reminder（到期提醒）是两种不同职责，前者是 Offset Policy 管辖的全部范围；后者继续完全由 V1 按既有 `REMINDER_INTERVAL_HOURS` 逻辑负责，不为一个空 offset 引入新的特殊规则。OffsetEngine 侧因此不需要为空数组分支新增任何代码路径。
 
 ### 3.4 IDENTITY / UPDATABLE_FIELDS
 
 - `reminder_policy` 不建议加入 `IDENTITY_AFFECTING_FIELDS`——跟 `budget`/`notes`/`description`/`tags` 同类，是"关于任务的元信息"而非"任务本身是什么"，不应该让改一次提醒策略触发去重 identity 重算。
-- 是否加入 `UPDATABLE_FIELDS`（创建后再改提醒策略）不在原始需求的三个例子范围内，建议作为明确的范围决定而非隐式假设（§7 第2项）。
+- `UPDATABLE_FIELDS`：已由决定 #2 确认本轮**不做**。本次仅覆盖 Create 流程；"创建后修改 reminder policy"是独立能力，不顺带实现，未来需要时另开 ADR/Phase。
 
 ### 3.5 已核实、确认不需要改动的部分
 
@@ -143,7 +140,7 @@ Reminder OS · 26_ReminderOffsetEngine.gs                         ← 改动 ④
 ## 6. Deliverables（沿用原文档编号，补充实际范围）
 
 1. Architecture Review —— 本文档
-2. ADR updates —— 视 §7 第1、2项决定而定
+2. ADR updates —— 记录决定 #1/#2/#3，以及 §3.2「决定 #3 落地时机」的最终口径；挂靠新 ADR 还是现有 ADR 的 amendment，仍待你指定
 3. Schema changes —— `15_Setup.gs`（表头 + `migrateSchemaReminderPolicy()`）
 4. Productivity Parser changes —— `06_TaskIntentParser.gs` + `09_TemporalParser.gs`（Productivity OS 版本）
 5. Task persistence changes —— `20_TaskEngine.gs` + `09_IdempotencyManager.gs`
@@ -157,8 +154,38 @@ Reminder OS · 26_ReminderOffsetEngine.gs                         ← 改动 ④
 
 ---
 
-## 7. 需要你决定的三件事
+## 7. 决定记录（已闭环）
 
-1. **§3.3 Due Reminder 语义**——方案 A（`offset=0` 规则，OffsetEngine 内统一处理）还是方案 B（维持 V1 现状不变，不新增语义）？
-2. **ADR 归档位置**（新开一份还是作为现有 ADR 的又一轮 amendment）+ `UPDATABLE_FIELDS` 是否本次一并做？
-3. **§3.2 人工规则的优先级让步**——接受"先来后到"（manual 优先于 override），还是希望 override 显式覆盖已存在的 manual 规则？
+**已由 Carson 确认（2026-07-17）：**
+
+1. **Due Reminder 语义**——方案 B：V1 保持不变，不新增 offset=0 特殊规则（§3.3）。
+2. **范围**——本次只做 Create 流程；「创建后修改 reminder policy」不在本次范围内，需要时另开 ADR/Phase（§3.4）。
+3. **冲突优先级原则**——Task.reminder_policy 是唯一 Truth Source，ReminderRules 是 Materialized Projection，Task > ReminderRules（§3.2）。
+4. **落地时机**——窄口径：只在 Offset Engine 首次物化该 task 时生效，不引入持续 Rebuild；手工改表是本阶段之外的 escape hatch；未来若支持编辑 reminder policy，由那个能力自行设计 Re-materialization 流程（§3.2）。
+
+五项原则全部保持成立：Core Connector 不改 / Reminder OS Connector 只读 / Productivity Parser 解析自然语言 / Reminder OS 物化规则（首次物化，非持续） / 完全向后兼容。未发现新的 HIGH/MEDIUM 风险，设计阶段结束，可进入实现。
+
+---
+
+## 8. 实现记录（2026-07-17）
+
+**改动文件（只列有改动/新增的，按 Carson 的既有惯例，.gs 以 .txt 交付）：**
+
+Reminder OS：`26_ReminderOffsetEngine.txt`（核心引擎逻辑）、
+`50_ReminderOffsetEngine_Tests.txt`（新增场景 G/H/I + `_offsetToMinutes_`
+纯函数测试）、`00_ADR_006_Reminder_Policy_Override.txt`（新建）、
+`00_Project_State.txt`（追加变更记录）。
+
+Productivity OS：`09_TemporalParser.txt`（新增 `_extractReminderOffsets_`）、
+`06_TaskIntentParser.txt`、`20_TaskEngine.txt`、`15_Setup.txt`、
+`11_ProjectionRebuilder.txt`（新增 `migrateSchemaReminderPolicy`）、
+`00_Known_Limitations.txt`、`00_ADR.txt`（新增
+ADR-2026-07-17-009）、`34_Tests_ReminderPolicy.txt`（新建）。
+
+**实现过程中发现、需要你知道的两件事：**
+
+1. **实际解析器是中文优先的，原始需求文档的英文例子只是示意。** 09_TemporalParser.gs 里其余的日期/重复规则识别（"明天"、"下周"、"每天"）全部只认中文，00_Known_Limitations.gs 早就明确记录"不支持英文日期/重复说法"。这次新增的 offset 短语识别因此做成中英文都支持——中文（"提前30分钟提醒我"）匹配这份解析器实际的使用语言，英文（"remind me 30 minutes before"）逐字匹配原始需求文档举的例子——两者字符集不重叠，同时支持不冲突。具体识别规则见 09_TemporalParser.gs 函数头注释的"已知限制"（比如要求"提前"/"remind me"字面出现，多个 offset 需要连接词）。
+
+2. **Productivity OS 的 `00_Project_State.txt` 这次没有改。** 打开后发现这份文件实际记录的是"Rider OS"（同一个仓库里的另一个子域——预约/奖励那部分，31_ReminderQueue.gs/27_BookingEngine.gs 所在的领域）的状态快照，不是 Task 管理这部分的。Task 域的变更记录已经写进 00_ADR.txt 的 ADR-2026-07-17-009，但如果 Task 域本身也应该有一份对应的"当前快照"文件、只是我没找到，需要你指一下具体在哪，我可以补上。
+
+**验证：** Reminder OS 侧完整跑了现有测试 harness（`node run_offset_tests.js`），51 项全部通过（含新增的 G/H/I 三个场景和 `_offsetToMinutes_` 的 5 个断言）。Productivity OS 侧没有现成的 Node harness，我用同样的方式手动搭了一个（eval 实际的 `09_TemporalParser.txt`/`06_TaskIntentParser.txt`/`34_Tests_ReminderPolicy.txt` 源文件本身，不是重新抄一遍逻辑），19 项断言全部通过，覆盖原始需求文档三个例子（含英文）、七个中文等价表达、两个误伤规避场景、title 清洗残渣检查、以及 `_formatReminderPolicyDisplay_` 的五种展示情形。两边都是真正执行的结果，不是只做了语法检查。
