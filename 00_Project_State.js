@@ -373,6 +373,18 @@
  *   92_。修复：25_ReminderEngine.gs（迁移观察期内的临时保留项）内部变量
  *   改名 ReminderEngineV1，20_ReminderEngine.gs 不用改。完整记录见
  *   00_ADR_007_Unified_Reminder_Engine.gs 的"2026-07-21 Hotfix"章节。
+ *
+ * - 2026-07-22：Carson 实测满意，批准彻底退役 25_ReminderEngine.gs
+ *   （不再是"观察期保留"）。排查"Overdue 每5分钟提醒2次、持续不停"这个
+ *   异常时，发现极可能是同一类变量冲突的另一个实例：12_QueryEngine.gs
+ *   （已被 22_QueryEngine.gs 取代，但没有 reminder_count/last_reminder_at
+ *   的定点合并逻辑）如果还留在部署里，可能导致 getPendingTasks() 读到
+ *   空的 last_reminder_at，让 Overdue 阶段的间隔判断永远判定"从没提醒
+ *   过"，每轮轮询都重新触发——症状完全吻合。这次一并清理四个同一模式的
+ *   遗留文件（新文件头都记录了"取代自哪个旧文件"，因此都能确认没有
+ *   独有能力）：25_ReminderEngine.gs、12_QueryEngine.gs、
+ *   92_ReminderEngine.gs、05_SheetUtils.gs，全部删除。完整决策依据见
+ *   00_ADR_007_Unified_Reminder_Engine.gs「2026-07-22 更新」章节。
  */
 
 // ============================================================

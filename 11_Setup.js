@@ -51,11 +51,16 @@
  * 批准）：createTriggers() 不再挂 checkReminders（V1，25_ReminderEngine.gs
  * 的每小时触发器）——V1 唯一还没被覆盖的能力（逾期持续提醒）已经搬进
  * checkOffsetReminders() 的 Overdue 阶段（20_ReminderEngine.gs，原
- * 26_ReminderOffsetEngine.gs）。25_ReminderEngine.gs 这个文件本身没有删
- * ——按迁移计划，先观察 Overdue 阶段的实际表现，确认没问题再删文件，这次
- * 只摘掉触发器，让 V1 停止运作。再次运行 createTriggers() 时，如果项目里
- * 还残留任何 checkReminders 触发器（比如手动加过），会被一并清掉，不会
- * 重新创建。
+ * 26_ReminderOffsetEngine.gs）。
+ *
+ * 🆕 2026-07-22 更新：Carson 实测满意，25_ReminderEngine.gs 本身已彻底
+ * 删除（不再是"观察期保留"）——同时排查一次疑似同类风险的旧文件一并
+ * 清理：12_QueryEngine.gs、92_ReminderEngine.gs、05_SheetUtils.gs，完整
+ * 理由见 00_ADR_007_Unified_Reminder_Engine.gs「2026-07-22 更新」章节。
+ * 再次运行 createTriggers() 时，如果项目里还残留任何 checkReminders
+ * 触发器（比如手动加过、或者删文件前就已经存在的触发器未清理），会被
+ * 一并清掉，不会重新创建——这一步是必须的：改 createTriggers() 的代码
+ * 本身不会retroactively删除已经存在的触发器，必须实际运行一次这个函数。
  *
  * 🆕 2026-07-14（Time-Based Offset Reminder Engine）：上面这段"不需要建
  * 任何新表"从这次起不再完全成立——ReminderRules/ReminderOccurrences/
@@ -83,7 +88,7 @@ function createTriggers() {
 
   Logger.log('✅ Reminder OS 自己的触发器挂好了:');
   Logger.log('  checkOffsetReminders — 每5分钟（Unified Reminder Engine，Pre-Due + Overdue 两个阶段）');
-  Logger.log('  （V1 的 checkReminders 已停用——25_ReminderEngine.gs 文件还在，按迁移计划观察期结束后再删）');
+  Logger.log('  （V1 已彻底退役——25_ReminderEngine.gs 文件应该已被删除，如果 Triggers 面板还显示 checkReminders，重新运行这个函数会清掉它）');
 }
 
 /**

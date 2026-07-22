@@ -12,6 +12,11 @@
  * P4 追加 REMINDER_INTERVAL_HOURS 数值去向说明（搬进新的
  * OVERDUE_POLICY_CONFIG，不是丢弃）。25_ReminderEngine.gs 停用触发器、
  * 文件本身保留观察期。
+ * 2026-07-22 — Carson 实测满意，25_ReminderEngine.gs 彻底删除（不再是
+ * 观察期保留）；同一次排查中一并删除三个同类风险的遗留文件
+ * （12_QueryEngine.gs/92_ReminderEngine.gs/05_SheetUtils.gs——都已被
+ * 更新的版本取代，留在部署里有全局命名冲突风险，25_/20_ 那次冲突就是
+ * 实例）。完整依据见 00_ADR_007_Unified_Reminder_Engine.gs。
  * 2026-07-13 — 新增 P8（演进原则：保守优先，Claude 架构
  * 复审会话固定应用的默认立场）；新增 P9（领域边界：Reminder OS 不是
  * Calendar OS，Future-Proof Architecture Validation 结论）。
@@ -61,11 +66,12 @@
  *     REMINDER_SENT 事件到共享 Events 表。
  *
  *     ✅ 2026-07-19 更新（Unified Reminder Engine）：这条边界本身没变，
- *     只是写入方从 25_ReminderEngine.gs（V1，已停用触发器）换成
+ *     只是写入方从 25_ReminderEngine.gs（V1，已删除）换成
  *     20_ReminderEngine.gs 的 Overdue 阶段——同样只写这两个字段，同样用
  *     SheetUtils.batchUpdateFieldsByKey_ 做定点更新，不是重新设计一套
- *     写入机制。25_ReminderEngine.gs 文件本身还在（迁移观察期），但它的
- *     触发器已经摘掉，不会再实际写入。
+ *     写入机制。25_ReminderEngine.gs 文件本身已经删除（2026-07-22，
+ *     Carson 批准彻底退役，完整依据见
+ *     00_ADR_007_Unified_Reminder_Engine.gs）。
  *
  *     ✅ 2026-07-06 更新（外部审计 HIGH RISK 1 关联）：写 Tasks 表这两个
  *     字段的机制从"每个任务各自直接 upsertRowByKey_"改成"checkReminders()
